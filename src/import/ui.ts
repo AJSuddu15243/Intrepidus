@@ -3,27 +3,12 @@ import type { Memory } from '../memory.ts';
 import { bytes } from '../memory.ts';
 import { scanLocal, scanChatGPT, readConversation, type Conversation, type ImportedEntry, type Source } from './sources.ts';
 import { deduplicate, type ImportMode, type ImportJob, type ImportProgress } from './job.ts';
+import { selectMany } from './multi-select.ts';
+import { homedir } from 'node:os';
 
-type ImportUI = { ui: Pick<ExtensionUIContext, 'select' | 'input' | 'confirm' | 'notify' | 'setWidget'> };
+type ImportUI = { ui: Pick<ExtensionUIContext, 'select' | 'input' | 'confirm' | 'notify' | 'setWidget' | 'custom'> };
 const clean = (s: string) => s.replace(/[\x00-\x1f\x7f-\x9f]/g, ' ');
 const size = (n: number) => `${(n / 1_000_000).toFixed(1)} MB`;
-/** Repeated native selectors provide searchable multi-selection without a custom terminal framework. */
-async function selectMany<T>(ctx: ImportUI, title: string, items: T[], label: (item: T) => string, signal: AbortSignal): Promise<T[] | undefined> {
-  const selected = new Set<number>();
-  while (true) {
-    const options = ['✓ Continue', 'Select all', 'Clear selection', ...items.map((item, i) => `${selected.has(i) ? '[x]' : '[ ]'} ${i + 1}. ${clean(label(item))}`)];
-    const choice = await ctx.ui.select(`${title} · ${selected.size} selected`, options, { signal });
-    if (!choice) return undefined;
-    if (choice === '✓ Continue') {
-      if (!selected.size) { ctx.ui.notify('Select at least one item.', 'info'); continue; }
-      return [...selected].sort((a, b) => a - b).map(i => items[i]);
-    }
-    if (choice === 'Select all') { items.forEach((_, i) => selected.add(i)); continue; }
-    if (choice === 'Clear selection') { selected.clear(); continue; }
-    const index = options.indexOf(choice) - 3;
-    if (index >= 0) { if (selected.has(index)) selected.delete(index); else selected.add(index); }
-  }
-}
 export async function chooseImport(ctx: ImportUI, profile: string, memory: Memory, model: string, signal: AbortSignal): Promise<{ entries: ImportedEntry[]; mode: ImportMode } | undefined> {
   const sourceLabel = await ctx.ui.select(`Import into ${profile} · source`, ['Claude Code', 'Codex', 'ChatGPT export'], { signal });
   if (!sourceLabel) return;
@@ -41,7 +26,7 @@ export async function chooseImport(ctx: ImportUI, profile: string, memory: Memor
   if (!candidates.length) throw new Error('No conversations found for this source.');
   if (source !== 'chatgpt') {
     const projects = [...new Set(candidates.map(c => c.project))].sort();
-    const selected = await selectMany(ctx, 'Projects', projects, p => `${p} (${candidates.filter(c => c.project === p).length} conversations)`, signal);
+    const selected = await selectMany(ctx.ui, 'Projects', projects, p => `${p.startsWith(homedir() + '/') ? '~' + p.slice(homedir().length) : p} (${candidates.filter(c => c.project === p).length} conversations)`, signal);
     if (!selected) return;
     candidates = candidates.filter(c => selected.includes(c.project));
   }
@@ -58,7 +43,7 @@ export async function chooseImport(ctx: ImportUI, profile: string, memory: Memor
   const scope = await ctx.ui.select(`${candidates.length} conversations · ${size(candidates.reduce((n, c) => n + c.size, 0))} source files`, ['All matching conversations', 'Choose individual conversations'], { signal });
   if (!scope) return;
   const conversations: Conversation[] | undefined = scope === 'Choose individual conversations'
-    ? await selectMany(ctx, 'Conversations', candidates, c => `${c.date.slice(0, 10)} · ${c.title} · ${c.id}`, signal) : candidates;
+    ? await selectMany(ctx.ui, 'Conversations', candidates, c => `${c.date.slice(0, 10)} · ${c.title} · ${c.id}`, signal) : candidates;
   if (!conversations) return;
   const entries: ImportedEntry[] = [], warnings = [...scan.warnings];
   try {
@@ -93,7 +78,7 @@ export async function chooseImport(ctx: ImportUI, profile: string, memory: Memor
   if (!await ctx.ui.confirm('Start import?', preview, { signal })) return;
   return { entries, mode };
 }
-export async function showProgress(ctx: ImportUI, job: ImportJob,
+export async function showProgress(ctx: { ui: Pick<ExtensionUIContext, 'select' | 'setWidget'> }, job: ImportJob,
   run: (signal: AbortSignal, progress: (value: ImportProgress) => void) => Promise<unknown>, outerSignal: AbortSignal) {
   const controller = new AbortController(), finished = new AbortController();
   const abort = () => controller.abort(); outerSignal.addEventListener('abort', abort, { once: true });

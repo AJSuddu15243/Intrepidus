@@ -73,7 +73,8 @@ export async function scanLocal(source: 'claude' | 'codex', roots?: string[], si
   const folders = roots ?? (source === 'claude' ? [join(homedir(), '.claude/projects')]
     : [join(homedir(), '.codex/sessions'), join(homedir(), '.codex/archived_sessions')]);
   const conversations: Conversation[] = [], warnings: string[] = [];
-  for (const folder of folders) for (const file of await filesUnder(folder, n => n.endsWith('.jsonl'), signal)) {
+  // Claude workflow journals contain orchestration events, not conversation messages.
+  for (const folder of folders) for (const file of await filesUnder(folder, n => n.endsWith('.jsonl') && !(source === 'claude' && n === 'journal.jsonl'), signal)) {
     const info = await stat(file);
     let id = basename(file, '.jsonl'), project = dirname(file), date = info.mtime.toISOString(), title = '';
     for await (const { value: v } of jsonLines(file, warnings, 60, signal)) {

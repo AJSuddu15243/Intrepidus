@@ -92,6 +92,8 @@ test('ChatGPT preserves tool-directed analysis and every branch, orders parents 
 test('local discovery distinguishes Claude child conversations sharing a session ID and can be cancelled', async () => {
   const dir = temp(), sub = join(dir, 'session', 'subagents'); mkdirSync(sub, { recursive: true });
   for (const name of ['a', 'b']) lines(join(sub, `agent-${name}.jsonl`), [{ type: 'user', sessionId: 'shared', cwd: '/project', timestamp: date, message: { role: 'user', content: name } }]);
+  const workflow = join(sub, 'workflows', 'wf-fixture'); mkdirSync(workflow, { recursive: true });
+  lines(join(workflow, 'journal.jsonl'), [{ type: 'started', agentId: 'a' }, { type: 'result', result: 'workflow metadata' }]);
   try {
     const scan = await scanLocal('claude', [dir]);
     assert.deepEqual(scan.conversations.map(c => c.id).sort(), ['shared/agent-a', 'shared/agent-b']);
@@ -199,7 +201,7 @@ test('preparation source dialog receives shutdown cancellation before staging an
     const ui = { select: async (_title: string, _options: string[], opts?: { signal?: AbortSignal }) => {
       assert.equal(opts?.signal, controller.signal);
       return new Promise<undefined>(resolve => opts?.signal?.addEventListener('abort', () => resolve(undefined), { once: true }));
-    }, input: async () => undefined, confirm: async () => false, notify: () => {}, setWidget: () => {} };
+    }, input: async () => undefined, confirm: async () => false, notify: () => {}, setWidget: () => {}, custom: async () => { throw new Error('unexpected picker'); } };
     const task = chooseImport({ ui }, 'test', memory, 'fixture', controller.signal); controller.abort();
     assert.equal(await task, undefined); assert.equal(pendingImport(dir), undefined);
   } finally { await memory.close(); rmSync(dir, { recursive: true, force: true }); }
