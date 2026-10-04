@@ -12,7 +12,7 @@ Restart Pi, choose **+ Create profile**, and create a profile such as `work` or 
 
 Requires Pi 1.0.2 or a compatible version, Node.js 22.19+, and Git. Tested on macOS; the offline tests also run on Linux. Web access is included, so a separate `pi-web-access` installation is unnecessary.
 
-The main agent uses the model and effort selected in Pi. Subagents default to **Anthropic Opus 5.5, high**; memory compression defaults to **Anthropic Sonnet 5.5, medium**. Change these with `/optchat agents` and `/optchat model` before chatting if you use other models. Both settings are stored separately in each profile. Authentication uses Pi's existing provider login.
+The main agent uses the model and effort selected in Pi. Subagents default to **Anthropic Opus 5.5, high**; memory compression defaults to **Anthropic Sonnet 5.5, medium**. Change these with `/optchat agents model` and `/optchat model` before chatting if you use other models. Both settings are stored separately in each profile and are independent of the main model. All descendants use the profile's subagent setting; changing it affects new launches. Authentication uses Pi's existing provider login.
 
 Compression and background agents make additional model requests using your configured provider credentials. The import preview shows the amount of text to index; it is not a price quote.
 
@@ -23,13 +23,29 @@ Compression and background agents make additional model requests using your conf
 | `/optchat` | Show status and the actions menu. |
 | `/optchat profile` | Select or create a profile; switching starts a fresh Pi session. |
 | `/optchat model` | Select this profile's compactor model and effort. |
-| `/optchat agents` | Select this profile's subagent model/effort, or stop a running child. |
+| `/optchat agents` | Open the live agent tree and saved run history. |
+| `/optchat agents model` | Select this profile's subagent model and effort, independently of the main model. |
+| `/optchat usage` | Usage by session, time range, role, and model. |
 | `/optchat instructions` | Edit this profile's persistent `AGENTS.md` in Pi. |
 | `/optchat browse` | Open a local HTML memory snapshot with the current view, every tree level, exact messages, date spans, and sizes. Run again to refresh it. |
 | `/optchat import` | Import Claude Code, Codex, or ChatGPT history; resume or discard a paused import. |
 | `/model` | Pi's normal main-model selector. |
 
-To delegate, say something like: “Spawn an agent to investigate this repository and report back.” The parent returns immediately, and the report arrives automatically. You can ask the parent to send a running child a follow-up through `tell`. Children get the same profile's memory and instructions, a frozen view, and read-only `zoom`/`date`; they cannot spawn grandchildren. They can use normal coding and web tools.
+To delegate, say something like: “Spawn an agent to investigate this repository and report back.” Each direct child reports independently when finished. Children get the same profile's memory and instructions, a frozen view, read-only `zoom`/`date`, and normal coding and web tools. You can ask the parent to send a running child guidance through `tell`.
+
+Delegation supports **main → child → grandchild → great-grandchild**, with at most **8 active agents per profile**, counting parents waiting for their descendants. Attempts beyond either limit return an error; there is no automatic queue. Descendant reports go to their immediate parent after that parent's current run ends. The harness keeps the parent session alive to process them and report back, without polling or waiting in model tools. A failed parent stops its remaining descendants. Stopping an agent stops its entire subtree.
+
+## Agent inspector and usage
+
+A compact **Agents | Usage** bar sits below the input. With an empty input and no autocomplete open, press **Down** to focus it, **Left/Right** to choose a section, and **Enter** to open it. **Escape/Up** returns to editing. Typing also returns to the editor. **F6** opens Agents directly while preserving an unfinished draft; `/optchat agents` and `/optchat usage` are alternative entry points. To use another shortcut, launch with `OPTCHAT_INSPECT_KEY=ctrl+shift+a pi`. If another extension supplies a custom editor, OptChat preserves it and offers the shortcut/commands instead of taking over its Down key.
+
+The list shows task names, parent/child indentation, state, elapsed time, current tools, and last activity. Use **Up/Down**, **Page Up/Down**, **Home/End**, and **Enter** to inspect a run; **M** in the list selects the subagent model. Inside a transcript, **T** expands tool arguments/results, **F** follows live output, **S** composes guidance, **X** stops the selected subtree, and **Escape** goes back. Scrolling pauses following so incoming output does not move the text you are reading. Guidance is shown as queued until it enters the child's conversation, or undelivered if the child stops first. Direct user guidance is also saved in the profile's main memory. Model reasoning is not displayed.
+
+Completed and partial transcripts remain browsable after restart. Pre-inspector child sessions are indexed too; uncertain interrupted work is labelled accordingly. Closing Pi still stops agents; this is not detached execution. Inspecting history does not add those transcripts to the manager's model context or make model requests.
+
+Press **Tab** to switch between Agents and Usage. In Usage, **Left/Right** selects this session, last hour, today (local time), last seven days, or all time. Totals and model breakdowns separate main-agent, subagent, compactor, and import work, including uncached input, output, cache reads/writes, and API-equivalent cost estimates. A child's transcript shows its own usage. Current parent context size is a separate Pi estimate, not cumulative consumption. Costs are estimates from model API rates, not a subscription bill or remaining allowance; unavailable rates can report zero.
+
+Usage updates when responses finish, including retries and reported usage on failures. Tool overhead can be an additional usage record, so record counts are not always request counts. Existing compactor/import records and saved child usage remain available by date. Main-agent tracking starts with this version and backfills a resumed session; older main sessions are not scanned globally. Historical records without parent-session attribution are excluded from **This session**. All views stay within the active profile.
 
 Web search and page fetching are bundled through `pi-web-access`. Keyless Exa search and fetching were verified live. The extension exposes its own additional commands, including `/websearch` for search configuration.
 
@@ -59,7 +75,7 @@ Both modes build in a separate memory generation. The active-memory pointer chan
 - After an import, `active-memory.json` points to `memories/<id>/`, which contains the active `main/` and `tree/`. Prior generations remain retained. `imports/pending.json` tracks resumable work; completed import records include the previous generation path. Keep these directories in backups.
 - `AGENTS.md`: profile instructions; `config.json`: compactor/subagent models.
 - `pending-inputs.json` and `pending-reports.json`: recovery journals.
-- `runs/`: child Pi sessions; `usage.jsonl`: compactor usage; `memory.html`: browser snapshot.
+- `runs/`: child Pi sessions and `*.optchat.json` run metadata; `usage.jsonl`: usage ledger for all roles; `memory.html`: browser snapshot.
 - Pi also retains its native sessions in Pi's normal session directory.
 
 The extension takes an exclusive lock per profile. You can run work and personal simultaneously, but two Pi processes cannot write the same profile. Resuming a Pi session restores its bound profile. New sessions offer the picker with the last-used profile first. For headless use, pass `--optchat-profile work`; this does not permit resuming a session bound to a different profile.
@@ -81,6 +97,7 @@ Implementation choices:
 3. Historical memory is text-only. Image blocks remain available within their active Pi run/session, but OptChat stores placeholders rather than a searchable image archive.
 4. Pi's automatic compaction and cache warming are disabled in favor of the recipe. An exceptionally long single run can still hit the model's context limit; stop it and continue in a new turn.
 5. Import adds historical source/date/branch guidance alongside the recipe prompts. Computer use and hosting on an always-on machine remain deferred.
+6. The agent inspector and usage ledger are local views, separate from the memory tree. Two intentional delegation changes: direct children report individually instead of waiting for their whole spawn batch, and children can delegate two extra levels with automatic parent continuation, bounded to 8 active agents. The original recipe prompt constants remain unchanged; child-specific delegation guidance is appended.
 
 Known edge case: Pi can transform a skill/template invocation (or image input) after the durable input journal records it. The expanded message is logged correctly, but the original form may also be recovered later as an unanswered input. Ordinary text chat is unaffected; this conservatively preserves input rather than risking the loss of an unrelated queued message.
 
@@ -108,6 +125,8 @@ npm run test:live
 Import adds eleven focused tests for the three adapters, ZIP reading, branch fidelity, discovery, duplicate detection, append/rebuild activation, pause/resume/discard, post-pointer crash recovery, and dialog cancellation. Local Claude Code/Codex discovery and sample transcript parsing were also exercised without storing their contents in profiles or sending them to a model. The import changes received separate lifecycle and parser/fidelity reviews.
 
 Three picker tests cover scrolling through long lists, preserving position on toggle, narrow terminals/resizing, filtered selection, and shutdown cancellation. The custom picker was also checked in the native Pi terminal with 150 long project paths.
+
+Agent/usage tests exercise real SDK sessions with a deterministic local provider: live streaming, independent results, queued/delivered guidance, stop and subtree cancellation, three-level result routing, depth/concurrency limits, persisted transcripts, profile boundaries, usage replay without double counting, legacy/torn records, local-date filters, and inspector keyboard navigation/resizing. They make no paid model requests.
 
 The installed Pi UI was exercised end to end using a synthetic ChatGPT fixture: choose rebuild, start Sonnet compression, pause, confirm chat is blocked, quit/restart Pi, resume, activate the completed generation, then ask Opus to retrieve the exact original phrase with `zoom`. The original generation remained intact throughout.
 

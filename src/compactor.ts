@@ -1,4 +1,5 @@
-import type { AssistantMessage, Message, ThinkingLevel } from '@earendil-works/pi-ai';
+import type { AssistantMessage, Message } from '@earendil-works/pi-ai';
+import type { ThinkingLevel } from '@earendil-works/pi-agent-core';
 import type { ModelRegistry } from '@earendil-works/pi-coding-agent';
 import { COMPACT } from './prompts.ts';
 import { bytes, NODE, type Compressor } from './memory.ts';
@@ -19,11 +20,11 @@ export function createCompressor(registry: ModelRegistry, choice: () => ModelCho
     const tries: string[] = [];
     for (let attempt = 0; attempt < 5; attempt++) {
       const reply = await registry.streamSimple(model, { systemPrompt: COMPACT, messages }, {
-        reasoning: selected.thinking, signal, cacheRetention: 'short',
+        reasoning: selected.thinking === 'off' ? undefined : selected.thinking, signal, cacheRetention: 'short',
         onPayload: payload => model.api === 'anthropic-messages' ? cachePayload(payload) : payload,
       }).result();
-      if (reply.stopReason === 'error' || reply.stopReason === 'aborted') throw new Error(reply.errorMessage ?? `Compactor ${reply.stopReason}`);
       onUsage(reply);
+      if (reply.stopReason === 'error' || reply.stopReason === 'aborted') throw new Error(reply.errorMessage ?? `Compactor ${reply.stopReason}`);
       const line = reply.content.filter(c => c.type === 'text').map(c => c.text).join('').trim();
       if (!line) throw new Error('Compactor returned no text.');
       tries.push(line);
