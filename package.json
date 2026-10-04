@@ -1,6 +1,6 @@
 {
-  "name": "pi-optchat",
-  "version": "0.3.1",
+  "name": "intrepidus",
+  "version": "0.1.0",
   "type": "module",
   "pi": {
     "extensions": [
@@ -33,23 +33,25 @@
     "@earendil-works/pi-tui": "*",
     "typebox": "*"
   },
-  "description": "OptChat memory for Pi: persistent profiles, zoomable history, background agents, and conversation imports.",
+  "description": "Intrepidus: team-shared OptChat for Pi. Each teammate keeps their own endless chat; every teammate's agent can read, zoom into and search the others'. Fork of pi-optchat.",
   "keywords": [
     "pi-package",
     "pi-extension",
     "optchat",
     "memory",
-    "subagents"
+    "subagents",
+    "team",
+    "intrepidus"
   ],
-  "author": "Jonas",
+  "author": "Ananth Jayakrishnan",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/jonaslsaa/pi-optchat.git"
+    "url": "git+https://github.com/AJSuddu15243/Intrepidus.git"
   },
-  "homepage": "https://github.com/jonaslsaa/pi-optchat#readme",
+  "homepage": "https://github.com/AJSuddu15243/Intrepidus#readme",
   "bugs": {
-    "url": "https://github.com/jonaslsaa/pi-optchat/issues"
+    "url": "https://github.com/AJSuddu15243/Intrepidus/issues"
   },
   "engines": {
     "node": ">=22.19.0"

@@ -1,5 +1,12 @@
 # Third-party notices
 
+## pi-optchat
+
+Intrepidus is a fork of `pi-optchat` by Jonas Silva, distributed under the MIT
+license. The original LICENSE is retained in this repository.
+
+https://github.com/jonaslsaa/pi-optchat
+
 ## Victor Taelin's OptChat recipe
 
 The OptChat memory design and the four prompt strings in `src/prompts.ts`
