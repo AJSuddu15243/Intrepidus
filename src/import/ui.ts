@@ -23,7 +23,7 @@ export async function chooseImport(ctx: ImportUI, profile: string, memory: Memor
     } else scan = await scanLocal(source, undefined, signal);
   } finally { ctx.ui.setWidget('optchat-import', undefined); }
   let candidates = scan.conversations;
-  if (!candidates.length) throw new Error('No conversations found for this source.');
+  if (!candidates.length) throw new Error(`No conversations found for this source.${scan.warnings.length ? '\n' + scan.warnings.slice(0, 4).map(clean).join('\n') : ''}`);
   if (source !== 'chatgpt') {
     const projects = [...new Set(candidates.map(c => c.project))].sort();
     const selected = await selectMany(ctx.ui, 'Projects', projects, p => `${p.startsWith(homedir() + '/') ? '~' + p.slice(homedir().length) : p} (${candidates.filter(c => c.project === p).length} conversations)`, signal);
@@ -55,9 +55,10 @@ export async function chooseImport(ctx: ImportUI, profile: string, memory: Memor
     }
   } finally { ctx.ui.setWidget('optchat-import', undefined); }
   if (warnings.length) {
-    const choice = await ctx.ui.select(`${warnings.length} source records could not be imported.\n${warnings.slice(0, 4).map(clean).join('\n')}`, ['Cancel', 'Continue with supported records'], { signal });
+    const choice = await ctx.ui.select(`${warnings.length} source issues: unavailable conversations or unsupported records.\n${warnings.slice(0, 4).map(clean).join('\n')}`, ['Cancel', 'Continue with supported records'], { signal });
     if (choice !== 'Continue with supported records') return;
   }
+  if (!entries.length) { ctx.ui.notify('No readable messages remain to import. Rescan or choose different conversations.', 'info'); return; }
   const { added, skipped } = deduplicate(memory.root, entries);
   if (!added.length) { ctx.ui.notify(`Nothing new to import (${skipped} messages already present).`, 'info'); return; }
   let mode: ImportMode = 'append';
@@ -74,7 +75,7 @@ export async function chooseImport(ctx: ImportUI, profile: string, memory: Memor
   let nodes = 0;
   for (let n = memory.root.length + added.length; n > 0; n = Math.floor(n / 2)) nodes += n;
   if (mode === 'append') nodes -= memory.tree.size;
-  const preview = `${profile} · ${mode}\n${conversations.length} conversations · ${added.length} new messages · ${skipped} duplicates skipped\n${size(inputBytes)} text to index (~${Math.ceil(inputBytes / 4).toLocaleString()} source tokens; rough estimate)\nCompactor: ${model}\nUp to ${nodes} new summary nodes; small nodes need no model call. Context and retries add usage.\nChatting in this profile pauses until completion or discard. You can pause and resume compression. The previous memory is retained.`;
+  const preview = `${profile} · ${mode}\n${conversations.length} conversations selected · ${added.length} new messages · ${skipped} duplicates skipped\n${size(inputBytes)} text to index (~${Math.ceil(inputBytes / 4).toLocaleString()} source tokens; rough estimate)\nCompactor: ${model}\nUp to ${nodes} new summary nodes; small nodes need no model call. Context and retries add usage.\nChatting in this profile pauses until completion or discard. You can pause and resume compression. The previous memory is retained.`;
   if (!await ctx.ui.confirm('Start import?', preview, { signal })) return;
   return { entries, mode };
 }

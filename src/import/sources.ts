@@ -18,6 +18,8 @@ export interface Conversation {
 export interface Scan { conversations: Conversation[]; warnings: string[] }
 const exec = promisify(execFile);
 const string = (v: unknown) => typeof v === 'string' ? v : undefined;
+const missingSource = (error: unknown) => record(error) && (error.code === 'ENOENT' || error.code === 'ENOTDIR');
+const missingWarning = (file: string) => `${file}: source file is no longer available; conversation skipped. Rescan to retry if it returns.`;
 export function timestamp(value: unknown, fallback: string): string {
   const time = typeof value === 'number' ? value * 1000 : typeof value === 'string' ? Date.parse(value) : NaN;
   return Number.isFinite(time) ? new Date(time).toISOString() : fallback;
@@ -75,25 +77,32 @@ export async function scanLocal(source: 'claude' | 'codex', roots?: string[], si
   const conversations: Conversation[] = [], warnings: string[] = [];
   // Claude workflow journals contain orchestration events, not conversation messages.
   for (const folder of folders) for (const file of await filesUnder(folder, n => n.endsWith('.jsonl') && !(source === 'claude' && n === 'journal.jsonl'), signal)) {
-    const info = await stat(file);
-    let id = basename(file, '.jsonl'), project = dirname(file), date = info.mtime.toISOString(), title = '';
-    for await (const { value: v } of jsonLines(file, warnings, 60, signal)) {
-      if (source === 'codex' && v.type === 'session_meta' && record(v.payload)) {
-        id = string(v.payload.id) ?? id; project = string(v.payload.cwd) ?? project; date = timestamp(v.payload.timestamp ?? v.timestamp, date);
+    signal?.throwIfAborted();
+    try {
+      const info = await stat(file);
+      let id = basename(file, '.jsonl'), project = dirname(file), date = info.mtime.toISOString(), title = '';
+      for await (const { value: v } of jsonLines(file, warnings, 60, signal)) {
+        if (source === 'codex' && v.type === 'session_meta' && record(v.payload)) {
+          id = string(v.payload.id) ?? id; project = string(v.payload.cwd) ?? project; date = timestamp(v.payload.timestamp ?? v.timestamp, date);
+        }
+        if (source === 'claude') {
+          // Child logs share the parent's sessionId; their filenames distinguish the conversations.
+          id = file.includes('/subagents/') || basename(file).startsWith('agent-') ? `${string(v.sessionId) ?? basename(dirname(dirname(file)))}/${basename(file, '.jsonl')}` : string(v.sessionId) ?? id;
+          project = string(v.cwd) ?? project;
+          if (v.type === 'custom-title' || v.type === 'ai-title') title = string(v.customTitle ?? v.aiTitle) ?? title;
+        }
+        const m = source === 'claude' ? v.message : v.type === 'response_item' ? v.payload : undefined;
+        if (record(m) && m.role === 'user' && !title) {
+          title = text(m.content).replace(/\s+/g, ' ').slice(0, 110);
+          date = timestamp(v.timestamp, date);
+        }
       }
-      if (source === 'claude') {
-        // Child logs share the parent's sessionId; their filenames distinguish the conversations.
-        id = file.includes('/subagents/') || basename(file).startsWith('agent-') ? `${string(v.sessionId) ?? basename(dirname(dirname(file)))}/${basename(file, '.jsonl')}` : string(v.sessionId) ?? id;
-        project = string(v.cwd) ?? project;
-        if (v.type === 'custom-title' || v.type === 'ai-title') title = string(v.customTitle ?? v.aiTitle) ?? title;
-      }
-      const m = source === 'claude' ? v.message : v.type === 'response_item' ? v.payload : undefined;
-      if (record(m) && m.role === 'user' && !title) {
-        title = text(m.content).replace(/\s+/g, ' ').slice(0, 110);
-        date = timestamp(v.timestamp, date);
-      }
+      conversations.push({ source, file, id, project, date, title: title || id, size: info.size });
+    } catch (error) {
+      signal?.throwIfAborted();
+      if (!missingSource(error)) throw error;
+      warnings.push(missingWarning(file));
     }
-    conversations.push({ source, file, id, project, date, title: title || id, size: info.size });
   }
   return { conversations: conversations.sort((a, b) => b.date.localeCompare(a.date)), warnings };
 }
@@ -129,6 +138,7 @@ export async function scanChatGPT(input: string, signal?: AbortSignal): Promise<
 }
 
 export async function readConversation(c: Conversation, signal?: AbortSignal): Promise<{ entries: ImportedEntry[]; warnings: string[] }> {
+  signal?.throwIfAborted();
   const entries: ImportedEntry[] = [], warnings: string[] = [];
   const add = (id: string, kind: Kind, value: string, date: string, identity = value) => { const entry = imported(c, id, kind, value, date, identity); if (entry) entries.push(entry); };
   if (c.source === 'chatgpt') {
@@ -174,34 +184,41 @@ export async function readConversation(c: Conversation, signal?: AbortSignal): P
       add('export:selected-branch', 'note', `Selected ChatGPT branch in the ${snapshot} export snapshot ends at message ${String(c.exported?.current_node)}. Other branches are alternatives.`, snapshot);
     }
   } else {
-    for await (const { value: v, line } of jsonLines(c.file, warnings, Infinity, signal)) {
-      const date = timestamp(v.timestamp, c.date);
-      if (c.source === 'claude' && ['user', 'assistant'].includes(String(v.type)) && record(v.message)) {
-        const m = v.message, id = string(v.uuid) ?? `line:${line}`;
-        if (typeof m.content === 'string') add(id, m.role === 'user' ? 'user' : 'talk', m.content, date);
-        else if (Array.isArray(m.content)) for (const [index, b] of m.content.entries()) {
-          if (!record(b)) continue;
-          if (b.type === 'tool_use' || b.type === 'server_tool_use') add(`${id}:${index}`, 'tool', `${String(b.name)} ${JSON.stringify(b.input)} [call ${String(b.id)}]`, date);
-          else if (b.type === 'tool_result') add(`${id}:${index}`, 'echo', `[call ${String(b.tool_use_id)}${b.is_error ? '; error' : ''}] ${text(b.content)}`, date);
-          else {
-            const content = text(b);
-            if (content) add(`${id}:${index}`, m.role === 'user' ? 'user' : 'talk', content, date);
-            else if (!['thinking', 'redacted_thinking', 'reasoning', 'encrypted_content', 'text'].includes(String(b.type)))
-              warnings.push(`${c.file}:${line}: unsupported Claude content block ${String(b.type)} skipped`);
+    try {
+      for await (const { value: v, line } of jsonLines(c.file, warnings, Infinity, signal)) {
+        const date = timestamp(v.timestamp, c.date);
+        if (c.source === 'claude' && ['user', 'assistant'].includes(String(v.type)) && record(v.message)) {
+          const m = v.message, id = string(v.uuid) ?? `line:${line}`;
+          if (typeof m.content === 'string') add(id, m.role === 'user' ? 'user' : 'talk', m.content, date);
+          else if (Array.isArray(m.content)) for (const [index, b] of m.content.entries()) {
+            if (!record(b)) continue;
+            if (b.type === 'tool_use' || b.type === 'server_tool_use') add(`${id}:${index}`, 'tool', `${String(b.name)} ${JSON.stringify(b.input)} [call ${String(b.id)}]`, date);
+            else if (b.type === 'tool_result') add(`${id}:${index}`, 'echo', `[call ${String(b.tool_use_id)}${b.is_error ? '; error' : ''}] ${text(b.content)}`, date);
+            else {
+              const content = text(b);
+              if (content) add(`${id}:${index}`, m.role === 'user' ? 'user' : 'talk', content, date);
+              else if (!['thinking', 'redacted_thinking', 'reasoning', 'encrypted_content', 'text'].includes(String(b.type)))
+                warnings.push(`${c.file}:${line}: unsupported Claude content block ${String(b.type)} skipped`);
+            }
           }
         }
+        if (c.source === 'codex' && v.type === 'response_item' && record(v.payload)) {
+          const m = v.payload, id = string(m.id) ?? string(m.call_id) ?? `line:${line}`;
+          if (m.type === 'message' && ['user', 'assistant'].includes(String(m.role)) && m.channel !== 'analysis')
+            add(id, m.role === 'user' ? 'user' : 'talk', text(m.content), date);
+          else if (m.type === 'function_call' || m.type === 'custom_tool_call')
+            add(`${id}:call`, 'tool', `${String(m.name)} ${String(m.arguments ?? m.input ?? '')} [call ${String(m.call_id)}]`, date);
+          else if (m.type === 'function_call_output' || m.type === 'custom_tool_call_output')
+            add(`${id}:output`, 'echo', `[call ${String(m.call_id)}] ${text(m.output)}`, date);
+          else if (m.type === 'agent_message') add(id, 'note', `[agent ${String(m.author)} to ${String(m.recipient)}] ${text(m.content)}`, date);
+          else if (!['message', 'reasoning'].includes(String(m.type))) warnings.push(`${c.file}:${line}: unsupported response item ${String(m.type)} skipped`);
+        }
       }
-      if (c.source === 'codex' && v.type === 'response_item' && record(v.payload)) {
-        const m = v.payload, id = string(m.id) ?? string(m.call_id) ?? `line:${line}`;
-        if (m.type === 'message' && ['user', 'assistant'].includes(String(m.role)) && m.channel !== 'analysis')
-          add(id, m.role === 'user' ? 'user' : 'talk', text(m.content), date);
-        else if (m.type === 'function_call' || m.type === 'custom_tool_call')
-          add(`${id}:call`, 'tool', `${String(m.name)} ${String(m.arguments ?? m.input ?? '')} [call ${String(m.call_id)}]`, date);
-        else if (m.type === 'function_call_output' || m.type === 'custom_tool_call_output')
-          add(`${id}:output`, 'echo', `[call ${String(m.call_id)}] ${text(m.output)}`, date);
-        else if (m.type === 'agent_message') add(id, 'note', `[agent ${String(m.author)} to ${String(m.recipient)}] ${text(m.content)}`, date);
-        else if (!['message', 'reasoning'].includes(String(m.type))) warnings.push(`${c.file}:${line}: unsupported response item ${String(m.type)} skipped`);
-      }
+    } catch (error) {
+      signal?.throwIfAborted();
+      if (!missingSource(error)) throw error;
+      // Do not stage a partial conversation if the source becomes unavailable mid-read.
+      return { entries: [], warnings: [...warnings, missingWarning(c.file)] };
     }
   }
   const unique = new Map(entries.map(e => [e.receipt, e]));

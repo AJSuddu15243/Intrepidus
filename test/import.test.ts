@@ -1,8 +1,10 @@
-import { test } from 'node:test';
+import { test, mock } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import fs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import { execFileSync } from 'node:child_process';
 import { Memory, localDay, type Compressor } from '../src/memory.ts';
 import { scanLocal, scanChatGPT, readConversation, type Conversation, type ImportedEntry } from '../src/import/sources.ts';
@@ -99,6 +101,44 @@ test('local discovery distinguishes Claude child conversations sharing a session
     assert.deepEqual(scan.conversations.map(c => c.id).sort(), ['shared/agent-a', 'shared/agent-b']);
     assert.ok(scan.conversations.every(c => c.project === '/project' && c.date === date));
     await assert.rejects(scanLocal('claude', [dir], AbortSignal.abort()));
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('discovery continues when listed files disappear before stat or stream open', async () => {
+  const dir = temp(), first = join(dir, 'a.jsonl'), beforeStat = join(dir, 'b.jsonl'), beforeOpen = join(dir, 'c.jsonl');
+  for (const file of [first, beforeStat, beforeOpen]) lines(file, [{ type: 'user', sessionId: 'fixture', cwd: '/project', timestamp: date, message: { role: 'user', content: 'kept' } }]);
+  const original = fs.createReadStream;
+  const patched = mock.method(fs, 'createReadStream', (...args: Parameters<typeof fs.createReadStream>) => {
+    if (args[0] === first) rmSync(beforeStat);
+    if (args[0] === beforeOpen) rmSync(beforeOpen);
+    return original(...args);
+  });
+  syncBuiltinESMExports();
+  try {
+    const scan = await scanLocal('claude', [dir]);
+    assert.deepEqual(scan.conversations.map(c => c.file), [first]);
+    assert.equal(scan.warnings.length, 2);
+    assert.ok(scan.warnings.some(w => w.includes(beforeStat)));
+    assert.ok(scan.warnings.some(w => w.includes(beforeOpen)));
+    assert.ok(scan.warnings.every(w => w.includes('conversation skipped')));
+  } finally { patched.mock.restore(); syncBuiltinESMExports(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('a selected transcript disappearing warns without importing it; cancellation and unrelated I/O errors still fail', async () => {
+  const dir = temp(), file = join(dir, 'selected.jsonl');
+  try {
+    lines(file, [{ type: 'user', uuid: 'u', message: { role: 'user', content: 'selected conversation' } }]);
+    const scan = await scanLocal('claude', [dir]);
+    rmSync(file);
+    for (const source of ['claude', 'codex'] as const) {
+      const parsed = await readConversation({ ...scan.conversations[0], source });
+      assert.equal(parsed.entries.length, 0);
+      assert.equal(parsed.warnings.length, 1);
+      assert.match(parsed.warnings[0], /source file is no longer available/);
+    }
+    const reason = new Error('User cancelled');
+    await assert.rejects(readConversation(scan.conversations[0], AbortSignal.abort(reason)), error => error === reason);
+    await assert.rejects(readConversation(conversation('claude', dir)), (error: unknown) => error instanceof Error && 'code' in error && error.code === 'EISDIR');
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
