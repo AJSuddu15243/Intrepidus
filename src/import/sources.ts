@@ -1,0 +1,208 @@
+import { createReadStream } from 'node:fs';
+import { readdir, readFile, stat } from 'node:fs/promises';
+import { createInterface } from 'node:readline';
+import { basename, dirname, join, resolve } from 'node:path';
+import { homedir } from 'node:os';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+import { createHash } from 'node:crypto';
+import { record } from '../cache.ts';
+import { bytes, cap, type Entry, type Kind, type Origin } from '../memory.ts';
+
+export type Source = Origin['source'];
+export type ImportedEntry = Omit<Entry, 'i' | 'size'>;
+export interface Conversation {
+  source: Source; id: string; file: string; title: string; project: string; date: string; size: number;
+  exported?: Record<string, unknown>;
+}
+export interface Scan { conversations: Conversation[]; warnings: string[] }
+const exec = promisify(execFile);
+const string = (v: unknown) => typeof v === 'string' ? v : undefined;
+export function timestamp(value: unknown, fallback: string): string {
+  const time = typeof value === 'number' ? value * 1000 : typeof value === 'string' ? Date.parse(value) : NaN;
+  return Number.isFinite(time) ? new Date(time).toISOString() : fallback;
+}
+function text(value: unknown): string {
+  if (typeof value === 'string') return value;
+  if (Array.isArray(value)) return value.map(text).filter(Boolean).join('\n');
+  if (!record(value)) return '';
+  if (['thinking', 'redacted_thinking', 'reasoning', 'encrypted_content'].includes(String(value.type))) return '';
+  if (typeof value.text === 'string') return value.text;
+  if (['image', 'image_url', 'input_image', 'image_asset_pointer'].includes(String(value.type ?? value.content_type))) return '[image attachment; image bytes are not imported]';
+  if (value.content !== undefined) return text(value.content);
+  if (value.parts !== undefined) return text(value.parts);
+  if (typeof value.content_type === 'string') return `[${value.content_type} attachment; binary content is not imported]`;
+  return '';
+}
+const digest = (s: string) => createHash('sha256').update(s).digest('hex');
+function imported(c: Conversation, id: string, kind: Kind, content: string, date: string, identity = content): ImportedEntry | undefined {
+  if (!content.trim()) return undefined;
+  const body = kind === 'echo' ? cap(content) : content;
+  // Text provenance survives compression. Stable per-message receipts survive moved files and repeated exports.
+  const origin: Origin = { source: c.source, conversation: c.id, message: id, title: c.title, project: c.project };
+  return { kind, date, origin, text: `[Historical ${c.source} · ${date} · conversation ${c.id} · ${c.title}]\n${body}`,
+    receipt: `import:${digest(JSON.stringify([c.source, c.id, id, kind, identity]))}` };
+}
+async function* jsonLines(file: string, warnings: string[], limit = Infinity, signal?: AbortSignal) {
+  const stream = createReadStream(file, { encoding: 'utf8', signal });
+  const lines = createInterface({ input: stream, crlfDelay: Infinity });
+  let n = 0;
+  try {
+    for await (const line of lines) {
+      n++; if (!line.trim()) continue;
+      try { const value: unknown = JSON.parse(line); if (record(value)) yield { value, line: n }; }
+      catch { warnings.push(`${file}:${n}: invalid JSON record skipped`); }
+      if (n >= limit) break;
+    }
+  } finally { lines.close(); stream.destroy(); }
+}
+async function filesUnder(path: string, accept: (name: string) => boolean, signal?: AbortSignal): Promise<string[]> {
+  signal?.throwIfAborted();
+  const entries = await readdir(path, { withFileTypes: true }).catch(error => {
+    if (record(error) && error.code === 'ENOENT') return [];
+    throw error;
+  });
+  const files: string[] = [];
+  for (const entry of entries) {
+    if (entry.isDirectory()) files.push(...await filesUnder(join(path, entry.name), accept, signal));
+    else if (entry.isFile() && accept(entry.name)) files.push(join(path, entry.name));
+  }
+  return files.sort();
+}
+export async function scanLocal(source: 'claude' | 'codex', roots?: string[], signal?: AbortSignal): Promise<Scan> {
+  const folders = roots ?? (source === 'claude' ? [join(homedir(), '.claude/projects')]
+    : [join(homedir(), '.codex/sessions'), join(homedir(), '.codex/archived_sessions')]);
+  const conversations: Conversation[] = [], warnings: string[] = [];
+  for (const folder of folders) for (const file of await filesUnder(folder, n => n.endsWith('.jsonl'), signal)) {
+    const info = await stat(file);
+    let id = basename(file, '.jsonl'), project = dirname(file), date = info.mtime.toISOString(), title = '';
+    for await (const { value: v } of jsonLines(file, warnings, 60, signal)) {
+      if (source === 'codex' && v.type === 'session_meta' && record(v.payload)) {
+        id = string(v.payload.id) ?? id; project = string(v.payload.cwd) ?? project; date = timestamp(v.payload.timestamp ?? v.timestamp, date);
+      }
+      if (source === 'claude') {
+        // Child logs share the parent's sessionId; their filenames distinguish the conversations.
+        id = file.includes('/subagents/') || basename(file).startsWith('agent-') ? `${string(v.sessionId) ?? basename(dirname(dirname(file)))}/${basename(file, '.jsonl')}` : string(v.sessionId) ?? id;
+        project = string(v.cwd) ?? project;
+        if (v.type === 'custom-title' || v.type === 'ai-title') title = string(v.customTitle ?? v.aiTitle) ?? title;
+      }
+      const m = source === 'claude' ? v.message : v.type === 'response_item' ? v.payload : undefined;
+      if (record(m) && m.role === 'user' && !title) {
+        title = text(m.content).replace(/\s+/g, ' ').slice(0, 110);
+        date = timestamp(v.timestamp, date);
+      }
+    }
+    conversations.push({ source, file, id, project, date, title: title || id, size: info.size });
+  }
+  return { conversations: conversations.sort((a, b) => b.date.localeCompare(a.date)), warnings };
+}
+export async function scanChatGPT(input: string, signal?: AbortSignal): Promise<Scan> {
+  const path = resolve(input.startsWith('~/') ? join(homedir(), input.slice(2)) : input);
+  const info = await stat(path);
+  const documents: { file: string; content: string }[] = [];
+  const accept = (name: string) => /^conversations(?:[-_]?\d+)?\.json$/i.test(basename(name));
+  if (info.isDirectory()) {
+    for (const file of await filesUnder(path, accept, signal)) documents.push({ file, content: await readFile(file, { encoding: 'utf8', signal }) });
+  } else if (path.toLowerCase().endsWith('.zip')) {
+    const listing = await exec('unzip', ['-Z1', path], { signal, maxBuffer: 10_000_000 });
+    for (const name of listing.stdout.split('\n').filter(accept)) {
+      const result = await exec('unzip', ['-p', path, name], { signal, maxBuffer: 1_000_000_000 });
+      documents.push({ file: `${path}:${name}`, content: result.stdout });
+    }
+  } else documents.push({ file: path, content: await readFile(path, { encoding: 'utf8', signal }) });
+  if (!documents.length) throw new Error('No conversations.json or numbered conversation JSON files found. Select a ChatGPT export ZIP, extracted folder, or JSON file.');
+  const conversations: Conversation[] = [], warnings: string[] = [];
+  for (const doc of documents) {
+    const data: unknown = JSON.parse(doc.content);
+    if (!Array.isArray(data)) throw new Error(`${doc.file}: expected an array of exported ChatGPT conversations.`);
+    for (const value of data) {
+      if (!record(value) || !record(value.mapping) || typeof (value.id ?? value.conversation_id) !== 'string') {
+        warnings.push(`${doc.file}: unrecognized conversation skipped`); continue;
+      }
+      const id = String(value.id ?? value.conversation_id);
+      conversations.push({ source: 'chatgpt', id, file: doc.file, title: string(value.title) ?? id,
+        project: 'ChatGPT', date: timestamp(value.create_time, info.mtime.toISOString()), size: bytes(JSON.stringify(value)), exported: value });
+    }
+  }
+  return { conversations: conversations.sort((a, b) => b.date.localeCompare(a.date)), warnings };
+}
+
+export async function readConversation(c: Conversation, signal?: AbortSignal): Promise<{ entries: ImportedEntry[]; warnings: string[] }> {
+  const entries: ImportedEntry[] = [], warnings: string[] = [];
+  const add = (id: string, kind: Kind, value: string, date: string, identity = value) => { const entry = imported(c, id, kind, value, date, identity); if (entry) entries.push(entry); };
+  if (c.source === 'chatgpt') {
+    const mapping = c.exported?.mapping;
+    if (!record(mapping)) throw new Error('ChatGPT conversation has no message mapping.');
+    // Include every branch once. Parent-first traversal handles missing child timestamps.
+    const nodes = Object.entries(mapping).filter((pair): pair is [string, Record<string, unknown>] => record(pair[1]));
+    nodes.sort((a, b) => timestamp(record(a[1].message) ? a[1].message.create_time : undefined, c.date)
+      .localeCompare(timestamp(record(b[1].message) ? b[1].message.create_time : undefined, c.date)));
+    const ordered: typeof nodes = [], visited = new Set<string>(), visiting = new Set<string>();
+    const visit = (key: string, node: Record<string, unknown>) => {
+      if (visited.has(key)) return;
+      if (visiting.has(key)) throw new Error(`${c.title}: cycle in ChatGPT conversation mapping.`);
+      visiting.add(key);
+      const parent = typeof node.parent === 'string' ? mapping[node.parent] : undefined;
+      if (typeof node.parent === 'string' && record(parent)) visit(node.parent, parent);
+      visiting.delete(key); visited.add(key); ordered.push([key, node]);
+    };
+    for (const [key, node] of nodes) visit(key, node);
+    const selected = new Set<string>();
+    let cursor = string(c.exported?.current_node);
+    const hasSelectedBranch = !!cursor;
+    while (cursor && !selected.has(cursor)) {
+      const node = mapping[cursor]; if (!record(node)) break;
+      selected.add(cursor); cursor = string(node.parent);
+    }
+    const dates = new Map<string, string>();
+    for (const [key, node] of ordered) {
+      signal?.throwIfAborted();
+      const m = node.message;
+      const date = timestamp(record(m) ? m.create_time : undefined, dates.get(String(node.parent)) ?? c.date);
+      dates.set(key, date);
+      if (!record(m) || !record(m.author) || ['system', 'developer'].includes(String(m.author.role))) continue;
+      if ((m.channel === 'analysis' && (!m.recipient || m.recipient === 'all')) || (record(m.content) && ['thoughts', 'reasoning', 'reasoning_recap'].includes(String(m.content.content_type)))) continue;
+      const role = m.author.role, kind = role === 'user' ? 'user' : role === 'tool' ? 'echo' : role === 'assistant' ? (m.recipient && m.recipient !== 'all' ? 'tool' : 'talk') : undefined;
+      if (!kind) continue;
+      const content = text(m.content); if (!content) continue;
+      const branch = hasSelectedBranch ? selected.has(key) ? 'selected branch at export' : 'alternate branch, not the selected outcome' : 'branch selection unavailable';
+      add(string(m.id) ?? key, kind, `[message ${key}; parent ${String(node.parent ?? 'root')}; ${branch}${m.recipient ? `; recipient ${String(m.recipient)}` : ''}]\n${content}`, date, content);
+    }
+    if (hasSelectedBranch) {
+      const snapshot = timestamp(c.exported?.update_time, c.date);
+      add('export:selected-branch', 'note', `Selected ChatGPT branch in the ${snapshot} export snapshot ends at message ${String(c.exported?.current_node)}. Other branches are alternatives.`, snapshot);
+    }
+  } else {
+    for await (const { value: v, line } of jsonLines(c.file, warnings, Infinity, signal)) {
+      const date = timestamp(v.timestamp, c.date);
+      if (c.source === 'claude' && ['user', 'assistant'].includes(String(v.type)) && record(v.message)) {
+        const m = v.message, id = string(v.uuid) ?? `line:${line}`;
+        if (typeof m.content === 'string') add(id, m.role === 'user' ? 'user' : 'talk', m.content, date);
+        else if (Array.isArray(m.content)) for (const [index, b] of m.content.entries()) {
+          if (!record(b)) continue;
+          if (b.type === 'tool_use' || b.type === 'server_tool_use') add(`${id}:${index}`, 'tool', `${String(b.name)} ${JSON.stringify(b.input)} [call ${String(b.id)}]`, date);
+          else if (b.type === 'tool_result') add(`${id}:${index}`, 'echo', `[call ${String(b.tool_use_id)}${b.is_error ? '; error' : ''}] ${text(b.content)}`, date);
+          else {
+            const content = text(b);
+            if (content) add(`${id}:${index}`, m.role === 'user' ? 'user' : 'talk', content, date);
+            else if (!['thinking', 'redacted_thinking', 'reasoning', 'encrypted_content', 'text'].includes(String(b.type)))
+              warnings.push(`${c.file}:${line}: unsupported Claude content block ${String(b.type)} skipped`);
+          }
+        }
+      }
+      if (c.source === 'codex' && v.type === 'response_item' && record(v.payload)) {
+        const m = v.payload, id = string(m.id) ?? string(m.call_id) ?? `line:${line}`;
+        if (m.type === 'message' && ['user', 'assistant'].includes(String(m.role)) && m.channel !== 'analysis')
+          add(id, m.role === 'user' ? 'user' : 'talk', text(m.content), date);
+        else if (m.type === 'function_call' || m.type === 'custom_tool_call')
+          add(`${id}:call`, 'tool', `${String(m.name)} ${String(m.arguments ?? m.input ?? '')} [call ${String(m.call_id)}]`, date);
+        else if (m.type === 'function_call_output' || m.type === 'custom_tool_call_output')
+          add(`${id}:output`, 'echo', `[call ${String(m.call_id)}] ${text(m.output)}`, date);
+        else if (m.type === 'agent_message') add(id, 'note', `[agent ${String(m.author)} to ${String(m.recipient)}] ${text(m.content)}`, date);
+        else if (!['message', 'reasoning'].includes(String(m.type))) warnings.push(`${c.file}:${line}: unsupported response item ${String(m.type)} skipped`);
+      }
+    }
+  }
+  const unique = new Map(entries.map(e => [e.receipt, e]));
+  return { entries: [...unique.values()], warnings };
+}

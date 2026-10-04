@@ -1,0 +1,130 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync, appendFileSync, writeFileSync, mkdirSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { Memory, start, end, bytes, localDay, type Compression } from '../src/memory.ts';
+import { lockProfile } from '../src/profiles.ts';
+import { splitView, cachePayload } from '../src/cache.ts';
+import { logMessage, buildContext, boundedMessage } from '../src/transcript.ts';
+import { Inbox } from '../src/inbox.ts';
+import type { ToolResultMessage } from '@earendil-works/pi-ai';
+import type { AssistantMessage, SystemMessage, UserMessage } from '@earendil-works/pi-ai';
+
+test('tree covers all history, fits incrementally, and exact originals survive restart', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'optchat-test-'));
+  const calls: Compression[] = [];
+  const compress = async (input: Compression) => { calls.push(input); return input.source.slice(0, 170); };
+  let memory = new Memory(dir, compress, () => {}, 1500);
+  try {
+    for (let i = 0; i < 48; i++) memory.append('user', `Original ${i}: ${'valuable detail '.repeat(30)}`);
+    await memory.settle(AbortSignal.timeout(5000), true);
+    assert.equal(start(memory.view[0]), 0);
+    assert.equal(end(memory.view.at(-1)!), 48);
+    for (let i = 1; i < memory.view.length; i++) assert.equal(end(memory.view[i - 1]), start(memory.view[i]));
+    assert.ok(memory.size <= 1500);
+    assert.ok(memory.view.some(p => p.l > 0));
+    assert.ok(calls.every(c => !c.context.includes('not summarized yet')));
+    assert.match(memory.zoom(17, 1), /Original 17:/);
+    const originals = memory.root.map(e => e.text);
+    const parts = [...memory.view];
+    memory.append('talk', 'One short new reply.');
+    await memory.settle(AbortSignal.timeout(5000), true);
+    for (const before of parts) assert.ok(memory.view.some(after => start(after) <= start(before) && end(after) >= end(before)));
+    await memory.close();
+    memory = new Memory(dir, compress, () => {}, 1500);
+    await memory.settle(AbortSignal.timeout(5000), true);
+    assert.deepEqual(memory.root.slice(0, 48).map(e => e.text), originals);
+    assert.match(memory.zoom(17, 1), /valuable detail/);
+    assert.throws(() => memory.zoom(3, 4), /No line/);
+  } finally { await memory.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('pending compaction blocks a turn, cancellation works, failure retries', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'optchat-test-')); let attempts = 0;
+  const memory = new Memory(dir, async () => {
+    attempts++; if (attempts === 1) throw new Error('temporary outage'); return 'user: retained decision';
+  }, () => {}, 128000, 8, 100);
+  try {
+    memory.append('user', 'large message '.repeat(100));
+    await assert.rejects(memory.settle(AbortSignal.timeout(20)), /cancelled/);
+    await memory.settle(AbortSignal.timeout(2000));
+    assert.equal(attempts, 2); assert.ok(memory.ready); assert.equal(memory.root.length, 1);
+  } finally { await memory.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('torn final line is reported and the next append remains readable', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'optchat-test-')); let memory = new Memory(dir, async () => 'summary');
+  memory.append('user', 'first'); await memory.close();
+  appendFileSync(join(dir, 'main', `${localDay()}.jsonl`), '{"torn":');
+  const warnings: string[] = [];
+  memory = new Memory(dir, async () => 'summary', text => warnings.push(text));
+  memory.append('user', 'second'); await memory.close();
+  memory = new Memory(dir, async () => 'summary', () => {});
+  try { assert.equal(warnings.length, 1); assert.deepEqual(memory.root.map(e => e.text), ['first', 'second']); }
+  finally { await memory.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('a live profile cannot be opened by a second writer; other profiles can run', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'optchat-test-'));
+  const unlock = await lockProfile(dir, 'test owner');
+  try {
+    await assert.rejects(lockProfile(dir, 'second writer'), /test owner/);
+    const other = await lockProfile(dir + '-other', 'other profile'); await other();
+  } finally { await unlock(); }
+  const again = await lockProfile(dir, 'after close'); await again(); rmSync(dir, { recursive: true, force: true });
+});
+
+test('stable cache cuts preserve every character and cap marks at four', () => {
+  const view = '<chat>\n' + '0+1|summary of a decision\n'.repeat(5500) + '</chat>';
+  assert.equal(splitView(view).join(''), view);
+  const payload = { system: [{ type: 'text', text: 'system', cache_control: { type: 'ephemeral' } }],
+    messages: [{ role: 'user', content: [{ type: 'text', text: view }, { type: 'text', text: 'new question', cache_control: { type: 'ephemeral' } }] }],
+  };
+  const output = JSON.stringify(cachePayload(payload));
+  assert.equal((output.match(/cache_control/g) ?? []).length, 4);
+  assert.equal(payload.messages[0].content.map(b => b.text).join(''), view + 'new question');
+});
+
+test('next turn excludes old conversation; current tool loop and reasoning remain verbatim', async () => {
+  const system: SystemMessage = { role: 'system', content: 'old system', timestamp: 0 };
+  const old: UserMessage = { role: 'user', content: 'OLD FULL CONVERSATION', timestamp: 1 };
+  const current: UserMessage = { role: 'user', content: 'new question', timestamp: 2 };
+  const assistant: AssistantMessage = { role: 'assistant', content: [{ type: 'thinking', thinking: 'private thoughts', thinkingSignature: 'signed' }, { type: 'text', text: 'visible reply' }],
+    api: 'anthropic-messages', provider: 'anthropic', model: 'fixture', stopReason: 'stop', timestamp: 3,
+    usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } };
+  const projected = buildContext([system, old, current, assistant], [current, assistant], '<chat>\n0+1|old summary\n</chat>', 'new system');
+  assert.ok(!JSON.stringify(projected).includes('OLD FULL CONVERSATION'));
+  assert.equal(projected[2], assistant);
+  const dir = mkdtempSync(join(tmpdir(), 'optchat-test-')); const memory = new Memory(dir, async () => 'summary');
+  try { logMessage(memory, assistant); assert.equal(memory.root.length, 1); assert.equal(memory.root[0].text, 'visible reply'); }
+  finally { await memory.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('tool images survive active-context truncation while text is bounded', () => {
+  const image = { type: 'image' as const, mimeType: 'image/png', data: 'example-base64' };
+  const message: ToolResultMessage = { role: 'toolResult', toolCallId: 'read-1', toolName: 'read', isError: false, timestamp: 1,
+    content: [{ type: 'text', text: 'x'.repeat(40_000) }, image] };
+  const bounded = boundedMessage(message);
+  assert.equal(bounded.role, 'toolResult');
+  if (bounded.role !== 'toolResult') throw new Error('unexpected role');
+  assert.ok(bounded.content.includes(image));
+  assert.ok(bounded.content.filter(c => c.type === 'text').reduce((n, c) => n + c.text.length, 0) <= 30_000);
+});
+
+test('crash recovery saves unconsumed inputs once, including append-before-ack crash', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'optchat-test-'));
+  const memory = new Memory(dir, async () => 'summary');
+  try {
+    let inbox = new Inbox(dir);
+    inbox.record('queued while the agent was working');
+    assert.equal(inbox.claim('unrelated extension message'), undefined);
+    const delivered = inbox.record('delivered, but crashed before the journal acknowledgment');
+    memory.append('user', 'delivered, but crashed before the journal acknowledgment', new Date().toISOString(), delivered);
+    inbox = new Inbox(dir);
+    assert.equal(inbox.recover(memory), 1);
+    assert.equal(memory.root.length, 2);
+    assert.equal(new Inbox(dir).recover(memory), 0);
+    assert.equal(memory.root.length, 2);
+  } finally { await memory.close(); rmSync(dir, { recursive: true, force: true }); }
+});

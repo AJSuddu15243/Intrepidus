@@ -1,0 +1,214 @@
+import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, readdirSync, writeSync } from 'node:fs';
+import { join } from 'node:path';
+import { EventEmitter } from 'node:events';
+
+export const NODE = 512;
+export const VIEW = 128_000;
+export const CAP = 30_000;
+export type Kind = 'user' | 'talk' | 'tool' | 'echo' | 'note';
+export interface Origin { source: 'claude' | 'codex' | 'chatgpt'; conversation: string; message: string; title: string; project?: string }
+export interface Entry { i: number; kind: Kind; text: string; size: number; date: string; receipt?: string; origin?: Origin }
+export interface Part { l: number; i: number }
+export interface Summary extends Part { text: string; size: number }
+export interface Compression { context: string; source: string; merge: boolean; historical?: boolean }
+export type Compressor = (input: Compression, signal: AbortSignal) => Promise<string>;
+const key = ({ l, i }: Part) => `${l}:${i}`;
+export const start = ({ l, i }: Part) => i * 2 ** l;
+export const end = (part: Part) => start(part) + 2 ** part.l;
+export const bytes = (s: string) => Buffer.byteLength(s, 'utf8');
+export const flat = (s: string) => s.replace(/[\r\n]+/g, ' ');
+export function cap(text: string, limit = CAP) {
+  if (text.length <= limit) return text;
+  const notice = `\n[${text.length - limit} characters omitted; head and tail retained]\n`;
+  const half = Math.floor((limit - notice.length) / 2);
+  return text.slice(0, half) + notice + text.slice(-half);
+}
+export function localDay(date = new Date()) {
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
+}
+export function appendJson(file: string, value: unknown) {
+  const fd = openSync(file, 'a', 0o600);
+  try {
+    const data = Buffer.from(JSON.stringify(value) + '\n');
+    if (writeSync(fd, data) !== data.length) throw new Error(`Incomplete write: ${file}`);
+    fsyncSync(fd);
+  } finally { closeSync(fd); }
+}
+function records(dir: string, warn: (s: string) => void): unknown[] {
+  if (!existsSync(dir)) return [];
+  const result: unknown[] = [];
+  for (const name of readdirSync(dir).filter(n => n.endsWith('.jsonl')).sort()) {
+    const file = join(dir, name);
+    const text = readFileSync(file, 'utf8');
+    for (const [index, line] of text.split('\n').entries()) {
+      if (!line.trim()) continue;
+      try { result.push(JSON.parse(line)); }
+      catch { warn(`Skipped damaged JSON at ${file}:${index + 1}`); }
+    }
+    if (text && !text.endsWith('\n')) {
+      const fd = openSync(file, 'a');
+      try { writeSync(fd, '\n'); fsyncSync(fd); } finally { closeSync(fd); }
+    }
+  }
+  return result;
+}
+function object(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null;
+}
+function isEntry(value: unknown): value is Entry {
+  return object(value) && Number.isSafeInteger(value.i) && typeof value.kind === 'string'
+    && ['user', 'talk', 'tool', 'echo', 'note'].includes(value.kind)
+    && typeof value.text === 'string' && typeof value.date === 'string';
+}
+function isSummary(value: unknown): value is Summary {
+  return object(value) && Number.isSafeInteger(value.l) && Number.isSafeInteger(value.i)
+    && typeof value.text === 'string';
+}
+
+/** The log is authoritative. The tree and monotonically coarsening view follow recipe §§2–6. */
+export class Memory {
+  readonly root: Entry[] = [];
+  readonly tree = new Map<string, Summary>();
+  readonly view: Part[] = [];
+  private readonly events = new EventEmitter();
+  private readonly controller = new AbortController();
+  private readonly busy = new Map<string, Promise<void>>();
+  private readonly retryAt = new Map<string, number>();
+  private readonly reported = new Set<string>();
+  private retryTimer?: ReturnType<typeof setTimeout>;
+  private scheduled = false;
+  private stopped = false;
+  lastError?: string;
+
+  constructor(readonly directory: string, private readonly compress: Compressor,
+    private readonly warn: (s: string) => void = console.error,
+    readonly budget = VIEW, private readonly jobs = 8, private readonly retryMs = 10_000) {
+    for (const sub of ['main', 'tree']) mkdirSync(join(directory, sub), { recursive: true, mode: 0o700 });
+    for (const value of records(join(directory, 'main'), warn)) {
+      if (!isEntry(value) || value.i !== this.root.length) throw new Error('Invalid/noncontiguous OptChat log; refusing to change it.');
+      this.root.push({ ...value, size: bytes(`${value.kind}: ${value.text}`) });
+    }
+    for (const value of records(join(directory, 'tree'), warn)) {
+      if (!isSummary(value) || value.l < 0 || value.i < 0 || end(value) > this.root.length)
+        throw new Error('Invalid OptChat summary record.');
+      this.tree.set(key(value), { ...value, size: bytes(value.text) });
+    }
+    // Fold history in order; do not retile the entire log on each turn.
+    for (let i = 0; i < this.root.length; i++) { this.view.push({ l: 0, i }); this.fit(i + 1); }
+    this.schedule();
+  }
+  append(kind: Kind, text: string, date = new Date().toISOString(), receipt?: string) {
+    if (this.stopped) throw new Error('Memory is closed.');
+    const entry: Entry = { i: this.root.length, kind, text, date, size: bytes(`${kind}: ${text}`), ...(receipt ? { receipt } : {}) };
+    appendJson(join(this.directory, 'main', `${localDay()}.jsonl`), entry);
+    this.root.push(entry); this.view.push({ l: 0, i: entry.i }); this.fit(); this.schedule();
+    return entry;
+  }
+  node(part: Part) { return this.tree.get(key(part)); }
+  private text(part: Part) { return this.node(part)?.text ?? '(not summarized yet: zoom it)'; }
+  render() { return `<chat>\n${this.view.map(p => `${start(p)}+${2 ** p.l}|${flat(this.text(p))}`).join('\n')}\n</chat>`; }
+  get ready() { return this.view.every(p => this.node(p)); }
+  get pending() { return this.root.filter(e => !this.tree.has(key({ l: 0, i: e.i }))).length; }
+  get active() { return this.busy.size; }
+  get size() { return this.view.reduce((n, p) => n + bytes(this.text(p)), 0); }
+  private fit(total = this.root.length) {
+    let size = this.size;
+    while (size > this.budget) {
+      let best = -1; let due = -Infinity;
+      for (let j = 0; j + 1 < this.view.length; j++) {
+        const a = this.view[j], b = this.view[j + 1];
+        if (a.l !== b.l || a.i % 2 || b.i !== a.i + 1 || !this.node({ l: a.l + 1, i: a.i / 2 })) continue;
+        const age = (total - start(a)) / 2 ** (a.l + 2);
+        if (age > due) { best = j; due = age; }
+      }
+      if (best < 0) break;
+      const a = this.view[best], b = this.view[best + 1];
+      const parent = { l: a.l + 1, i: a.i / 2 };
+      size += bytes(this.text(parent)) - bytes(this.text(a)) - bytes(this.text(b));
+      this.view.splice(best, 2, parent);
+    }
+    this.events.emit('change');
+  }
+  private schedule() {
+    if (this.scheduled || this.stopped) return;
+    this.scheduled = true;
+    queueMicrotask(() => { this.scheduled = false; this.pump(); });
+  }
+  private pump() {
+    if (this.stopped) return;
+    const total = this.root.length;
+    const first = this.view.find(p => !this.node(p));
+    const boundary = first ? start(first) : total;
+    for (let l = 0; 2 ** l <= total; l++) {
+      for (let i = 0; (i + 1) * 2 ** l <= total; i++) {
+        if (this.busy.size >= this.jobs) return;
+        const part = { l, i }, id = key(part);
+        if (this.node(part) || this.busy.has(id) || (this.retryAt.get(id) ?? 0) > Date.now()) continue;
+        if ((l === 0 ? i : end(part)) > boundary) continue;
+        if (l && (!this.node({ l: l - 1, i: 2 * i }) || !this.node({ l: l - 1, i: 2 * i + 1 }))) continue;
+        const promise = this.build(part).catch(error => {
+          if (this.stopped) return;
+          this.lastError = error instanceof Error ? error.message : String(error);
+          if (!this.reported.has(id)) { this.reported.add(id); this.warn(`Compactor ${start(part)}+${2 ** l}: ${this.lastError}`); }
+          this.retryAt.set(id, Date.now() + this.retryMs);
+          if (!this.retryTimer) this.retryTimer = setTimeout(() => { this.retryTimer = undefined; this.schedule(); }, this.retryMs);
+        }).finally(() => { this.busy.delete(id); this.events.emit('change'); this.schedule(); });
+        this.busy.set(id, promise);
+      }
+    }
+    // A later failure can have a later deadline than the timer installed by the first.
+    const deadlines = [...this.retryAt.values()].filter(t => t > Date.now());
+    if (deadlines.length && !this.retryTimer) this.retryTimer = setTimeout(() => { this.retryTimer = undefined; this.schedule(); }, Math.max(1, Math.min(...deadlines) - Date.now()));
+  }
+  private async build(part: Part) {
+    const source = part.l === 0 ? `${this.root[part.i].kind}: ${this.root[part.i].text}`
+      : [0, 1].map(offset => this.text({ l: part.l - 1, i: 2 * part.i + offset })).join('\n');
+    const boundary = part.l === 0 ? start(part) : end(part);
+    const context = `<chat>\n${this.view.filter(p => end(p) <= boundary).map(p => flat(this.text(p))).join('\n')}\n</chat>`;
+    const mergeSource = part.l > 0 ? [0, 1].map(offset => flat(this.text({ l: part.l - 1, i: 2 * part.i + offset }))).join('\n') : source;
+    const text = bytes(source) <= NODE ? source : (await this.compress({ context, source: mergeSource, merge: part.l > 0,
+      historical: this.root.slice(start(part), end(part)).some(entry => !!entry.origin) }, this.controller.signal)).trim();
+    if (this.stopped) return;
+    if (!text) throw new Error('Compactor returned an empty summary.');
+    const node = { ...part, text, size: bytes(text) };
+    appendJson(join(this.directory, 'tree', `${localDay()}.jsonl`), node);
+    this.tree.set(key(part), node); this.retryAt.delete(key(part));
+    if (!this.retryAt.size) this.lastError = undefined;
+    this.fit();
+  }
+  async settle(signal?: AbortSignal, all = false): Promise<void> {
+    const done = () => this.ready && this.size <= this.budget && (!all || (this.busy.size === 0 && this.tree.size === this.expectedNodes()));
+    if (done()) return;
+    if (this.stopped || signal?.aborted) throw new Error('Memory wait cancelled.');
+    await new Promise<void>((resolve, reject) => {
+      const cleanup = () => { this.events.off('change', check); signal?.removeEventListener('abort', abort); };
+      const abort = () => { cleanup(); reject(new Error('Memory wait cancelled.')); };
+      const check = () => { if (this.stopped) abort(); else if (done()) { cleanup(); resolve(); } };
+      this.events.on('change', check); signal?.addEventListener('abort', abort, { once: true }); check();
+    });
+  }
+  private expectedNodes() {
+    let count = 0;
+    for (let n = this.root.length; n > 0; n = Math.floor(n / 2)) count += n;
+    return count;
+  }
+  zoom(id: number, n: number) {
+    if (!Number.isSafeInteger(id) || id < 0 || !Number.isSafeInteger(n) || n < 1 || !Number.isInteger(Math.log2(n)) || id % n || id + n > this.root.length)
+      throw new Error(`No line ${id}+${n}.`);
+    if (n === 1) { const entry = this.root[id]; return `${id}+0|${entry.kind}: ${entry.text}`; }
+    const l = Math.log2(n) - 1, i = 2 * id / n;
+    return [0, 1].map(offset => {
+      const part = { l, i: i + offset }, node = this.node(part);
+      if (!node) throw new Error('This range is not summarized yet.');
+      return `${start(part)}+${2 ** l}|${flat(node.text)}`;
+    }).join('\n');
+  }
+  date(id: number) {
+    if (!Number.isSafeInteger(id) || !this.root[id]) throw new Error(`No message ${id}.`);
+    return new Date(this.root[id].date).toString();
+  }
+  async close() {
+    this.stopped = true; this.controller.abort(); clearTimeout(this.retryTimer);
+    this.events.emit('change'); await Promise.allSettled(this.busy.values());
+  }
+}

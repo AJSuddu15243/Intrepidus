@@ -1,0 +1,319 @@
+import { execFile } from 'node:child_process';
+import { existsSync, readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { hostname } from 'node:os';
+import { createHash } from 'node:crypto';
+import type { AgentMessage } from '@earendil-works/pi-agent-core';
+import type { ThinkingLevel } from '@earendil-works/pi-ai';
+import type { ExtensionAPI, ExtensionContext, ExtensionCommandContext } from '@earendil-works/pi-coding-agent';
+import { Type } from 'typebox';
+import { Memory, appendJson } from './memory.ts';
+import { createCompressor } from './compactor.ts';
+import { atomicWrite, createProfile, instructions, lastProfile, listProfiles, loadConfig, lockProfile, profilePath, rememberProfile, saveConfig, type ProfileConfig } from './profiles.ts';
+import { MASTER, VIEW_DOC } from './prompts.ts';
+import { cachePayload, record } from './cache.ts';
+import { boundedMessage, buildContext, logMessage, textContent } from './transcript.ts';
+import { memoryTools, result } from './tools.ts';
+import { Children } from './agents.ts';
+import { exportBrowser } from './browser.ts';
+import { Inbox } from './inbox.ts';
+import { checkpoint } from './checkpoint.ts';
+import { memoryDirectory, pendingImport, prepareImport, runImport, discardImport } from './import/job.ts';
+import { chooseImport, showProgress } from './import/ui.ts';
+import { IMPORT_GUIDANCE } from './import/guidance.ts';
+
+const binding = 'optchat.profile';
+interface Active { name: string; dir: string; config: ProfileConfig; memory: Memory; inbox: Inbox; children: Children; unlock: () => Promise<void> }
+
+export default function optchat(pi: ExtensionAPI) {
+  let active: Active | undefined;
+  let run: AgentMessage[] = [];
+  let logged = 0;
+  let view: string | undefined;
+  let prompt = '';
+  let runStarted = false;
+  let fault: string | undefined;
+  let reports: string[] = [];
+  const receipts = new Map<AgentMessage, string>();
+  let checkpoints = Promise.resolve();
+  let importing = false;
+  let stopping = false;
+  let importController: AbortController | undefined;
+  let importTask: Promise<void> | undefined;
+  const reportReceipt = (text: string) => 'report:' + createHash('sha256').update(text).digest('hex');
+  const errorText = (error: unknown) => error instanceof Error ? error.message : String(error);
+  pi.registerFlag('optchat-profile', { description: 'OptChat profile (required for noninteractive sessions without a saved binding)', type: 'string' });
+  const required = () => { if (!active) throw new Error('Choose an OptChat profile first: /optchat profile'); return active; };
+  const status = (ctx: ExtensionContext) => {
+    const a = active;
+    ctx.ui.setStatus('optchat', a ? `OptChat: ${a.name} · ${a.memory.root.length} messages · ${a.memory.pending} pending · ${a.children.ids.length} agents${importing ? ' · importing' : pendingImport(a.dir) ? ' · import paused: /optchat import' : ''}` : 'OptChat: choose profile');
+  };
+  const saveReports = () => { if (active) atomicWrite(join(active.dir, 'pending-reports.json'), JSON.stringify(reports)); };
+  const flush = () => {
+    if (!active) return;
+    while (logged < run.length) {
+      const message = run[logged];
+      const receipt = receipts.get(message);
+      logMessage(active.memory, message, receipt); logged++;
+      if (receipt && !receipt.startsWith('report:')) active.inbox.acknowledge(receipt);
+      receipts.delete(message);
+      if (message.role === 'user') {
+        const index = reports.indexOf(textContent(message.content));
+        if (index >= 0) { reports.splice(index, 1); saveReports(); }
+      }
+    }
+  };
+  const stop = async () => {
+    stopping = true; importController?.abort(); await importTask?.catch(() => {});
+    if (!active) return;
+    const old = active;
+    try {
+      await old.children.close(); flush(); if (!pendingImport(old.dir)) old.inbox.recover(old.memory);
+      await old.memory.close(); await checkpoints;
+      await checkpoint(old.dir);
+    } finally {
+      await old.memory.close(); await old.unlock(); active = undefined;
+      run = []; logged = 0; view = undefined; runStarted = false; receipts.clear();
+    }
+  };
+  const chooseProfile = async (ctx: ExtensionContext): Promise<string | undefined> => {
+    if (!ctx.hasUI) return undefined;
+    const names = listProfiles(), last = lastProfile();
+    if (last) names.sort((a, b) => Number(b === last) - Number(a === last));
+    const selected = await ctx.ui.select('OptChat profile', [...names, '+ Create profile']);
+    if (selected !== '+ Create profile') return selected;
+    const name = (await ctx.ui.input('New profile name', 'work or personal'))?.trim();
+    if (!name) return undefined;
+    createProfile(name); return name;
+  };
+  const openProfile = async (name: string, ctx: ExtensionContext) => {
+    const dir = profilePath(name);
+    if (!existsSync(dir)) throw new Error(`Profile ${name} does not exist. Use /optchat profile to create it.`);
+    const unlock = await lockProfile(dir, `${name} · PID ${process.pid} · ${hostname()} · ${ctx.cwd}`);
+    let openingMemory: Memory | undefined;
+    try {
+      const config = loadConfig(dir);
+      const pending = join(dir, 'pending-reports.json');
+      const saved: unknown = existsSync(pending) ? JSON.parse(readFileSync(pending, 'utf8')) : [];
+      if (!Array.isArray(saved) || !saved.every(s => typeof s === 'string')) throw new Error('Invalid pending report journal.');
+      const memory = new Memory(memoryDirectory(dir), createCompressor(ctx.modelRegistry, () => config.compactor, message => {
+        appendJson(join(dir, 'usage.jsonl'), { date: new Date().toISOString(), role: 'compactor', model: message.model, usage: message.usage });
+        status(ctx);
+      }), warning => ctx.ui.notify(warning, 'error'));
+      openingMemory = memory;
+      const inbox = new Inbox(dir);
+      const recovered = pendingImport(dir) ? 0 : inbox.recover(memory);
+      if (recovered) ctx.ui.notify(`Recovered ${recovered} unanswered inputs into ${name}'s memory. Ask to continue them when ready.`, 'info');
+      const children = new Children(memory, ctx.modelRegistry, () => config.subagent, () => `${instructions(dir)}\n\n${IMPORT_GUIDANCE}`,
+        async text => { reports.push(text); saveReports(); pi.sendUserMessage(text, { deliverAs: 'steer', expandPromptTemplates: false }); }, text => ctx.ui.notify(text, 'error'), dir);
+      const loggedReports = new Set(memory.root.map(e => e.receipt));
+      reports = saved.filter((s): s is string => typeof s === 'string' && !loggedReports.has(reportReceipt(s)));
+      atomicWrite(pending, JSON.stringify(reports));
+      rememberProfile(name);
+      active = { name, dir, config, memory, inbox, children, unlock }; fault = undefined;
+      status(ctx);
+      ctx.ui.notify(`OptChat · ${name} · ${memory.root.length} messages\nCompactor: ${config.compactor.provider}/${config.compactor.model} (${config.compactor.thinking})`, 'info');
+      setImmediate(() => { if (active?.memory === memory && !pendingImport(dir)) for (const text of [...reports]) pi.sendUserMessage(text, { deliverAs: 'steer', expandPromptTemplates: false }); });
+    } catch (error) {
+      await openingMemory?.close();
+      if (active?.memory === openingMemory) active = undefined;
+      await unlock(); throw error;
+    }
+  };
+
+  pi.on('session_start', async (_event, ctx) => {
+    stopping = false;
+    const saved = ctx.sessionManager.getEntries().find(e => e.type === 'custom' && e.customType === binding);
+    const boundName = saved?.type === 'custom' && record(saved.data) && typeof saved.data.name === 'string' ? saved.data.name : undefined;
+    const flag = pi.getFlag('optchat-profile');
+    try {
+      if (boundName && typeof flag === 'string' && flag !== boundName) throw new Error(`Session belongs to ${boundName}; cannot resume it as ${flag}.`);
+      const name = boundName ?? (typeof flag === 'string' ? flag : await chooseProfile(ctx));
+      if (!name) { status(ctx); return; }
+      await openProfile(name, ctx);
+      if (!boundName) pi.appendEntry(binding, { name });
+    } catch (error) {
+      if (active) await stop().catch(() => {});
+      fault = errorText(error); ctx.ui.notify(fault, 'error');
+    }
+  });
+  pi.on('session_shutdown', stop);
+  pi.on('session_before_switch', () => importing || active?.children.active ? { cancel: true } : undefined);
+  pi.on('session_before_fork', () => importing || active?.children.active ? { cancel: true } : undefined);
+  pi.on('input', (event, ctx) => {
+    if (!active) { ctx.ui.notify(fault ?? 'Select a profile with /optchat profile before chatting.', 'error'); return { action: 'handled' }; }
+    if (importing || pendingImport(active.dir)) { ctx.ui.notify('This profile has an import in progress. Use /optchat import to resume or discard it, or switch profiles.', 'info'); return { action: 'handled' }; }
+    if (event.source !== 'extension') {
+      try { active.inbox.record(event.text); }
+      catch (error) { ctx.ui.notify(`Could not save input: ${errorText(error)}`, 'error'); return { action: 'handled' }; }
+    }
+    return { action: 'continue' };
+  });
+  pi.on('before_agent_start', (_event, ctx) => {
+    flush(); run = []; logged = 0; view = undefined; runStarted = true;
+    const a = required();
+    prompt = `${MASTER}\n\n${VIEW_DOC}\n\n${instructions(a.dir)}\n\n${IMPORT_GUIDANCE}\n\nWorking directory: ${ctx.cwd}`;
+  });
+  pi.on('message_end', (event, ctx) => {
+    if (!active || !runStarted) return;
+    const message = boundedMessage(event.message);
+    if (message.role === 'user') {
+      try {
+        const text = textContent(message.content);
+        if (reports.includes(text)) receipts.set(message, reportReceipt(text));
+        else {
+          let receipt = active.inbox.claim(text);
+          if (!receipt) { active.inbox.record(text); receipt = active.inbox.claim(text); }
+          if (receipt) receipts.set(message, receipt);
+        }
+      } catch (error) { ctx.abort(); fault = errorText(error); ctx.ui.notify(fault, 'error'); }
+    }
+    run.push(message);
+    if (view !== undefined) {
+      try { flush(); } catch (error) { ctx.abort(); fault = errorText(error); ctx.ui.notify(fault, 'error'); }
+    }
+    if (message !== event.message) return { message };
+  });
+  pi.on('context_with_system', async (event, ctx) => {
+    try {
+      const a = required();
+      if (importing || pendingImport(a.dir)) throw new Error('Profile is unavailable while importing.');
+      if (fault) throw new Error(fault);
+      if (view === undefined) {
+        ctx.ui.setWorkingMessage('Waiting for OptChat summaries…');
+        await a.memory.settle(ctx.signal);
+        view = a.memory.render(); // Capture old history before logging the new input.
+        flush(); ctx.ui.setWorkingMessage();
+      }
+      return { messages: buildContext(event.messages, run, view, prompt) };
+    } catch (error) {
+      // Pi catches extension errors. Explicitly abort so it cannot fall back to old context.
+      ctx.abort();
+      try { flush(); } catch (persistenceError) { fault = errorText(persistenceError); }
+      ctx.ui.notify(errorText(error), 'error');
+      return { messages: [{ role: 'system', content: 'OptChat context unavailable. Stop.', timestamp: 0 }] };
+    }
+  });
+  pi.on('before_provider_request', (event, ctx) => ctx.model?.api === 'anthropic-messages' ? cachePayload(event.payload) : event.payload);
+  pi.on('cache_warming_decision', () => ({ action: 'stop' }));
+  pi.on('session_before_compact', (_event, ctx) => {
+    ctx.ui.notify('OptChat manages history between turns. Pi compaction is disabled; an exceptionally long single run may require stopping and continuing in a new turn.', 'info');
+    return { cancel: true };
+  });
+  pi.on('agent_settled', async (_event, ctx) => {
+    try { flush(); } catch (error) { fault = errorText(error); ctx.ui.notify(fault, 'error'); }
+    runStarted = false; status(ctx);
+    if (active) {
+      const dir = active.dir;
+      checkpoints = checkpoints.then(() => checkpoint(dir)).catch(error => ctx.ui.notify(`Local checkpoint failed: ${errorText(error)}`, 'error'));
+      await checkpoints;
+    }
+  });
+  for (const tool of memoryTools(() => required().memory)) pi.registerTool(tool);
+  pi.registerTool({ name: 'spawn', label: 'Spawn background agents',
+    description: 'Start background subagents, returning IDs immediately. Use only when the user asks. Each receives the current memory view and read-only zoom/date. Completion reports arrive automatically; never poll or sleep waiting for them. Children cannot spawn.',
+    parameters: Type.Object({ tasks: Type.Array(Type.Object({ task: Type.String(), cwd: Type.Optional(Type.String()) }), { minItems: 1, maxItems: 8 }) }),
+    async execute(_id, args, signal, _update, ctx) {
+      const ids = await required().children.spawn(args.tasks, ctx.cwd, signal); status(ctx);
+      return result(`Started: ${ids.join(', ')}. Reports will arrive automatically.`);
+    },
+  });
+  pi.registerTool({ name: 'tell', label: 'Tell background agent', description: 'Send a message to a running subagent at its next tool boundary.',
+    parameters: Type.Object({ id: Type.String(), message: Type.String() }),
+    async execute(_id, args) { return result(await required().children.tell(args.id, args.message)); },
+  });
+
+  const pickModel = async (ctx: ExtensionCommandContext, role: 'compactor' | 'subagent') => {
+    const a = required(), current = a.config[role];
+    const choices = ctx.modelRegistry.getAvailable().map(m => `${m.provider}/${m.id}`);
+    choices.sort((a, b) => Number(b === `${current.provider}/${current.model}`) - Number(a === `${current.provider}/${current.model}`) || a.localeCompare(b));
+    const selected = await ctx.ui.select(`${a.name}: ${role} model`, choices);
+    if (!selected) return;
+    const thinking = await ctx.ui.select('Thinking level', ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']);
+    if (!thinking) return;
+    const separator = selected.indexOf('/');
+    a.config[role] = { provider: selected.slice(0, separator), model: selected.slice(separator + 1), thinking: thinking as ThinkingLevel };
+    saveConfig(a.dir, a.config); ctx.ui.notify(`${role}: ${selected} (${thinking}); applies to new calls.`, 'info');
+  };
+  const command = async (args: string, ctx: ExtensionCommandContext): Promise<void> => {
+    if (importing) throw new Error('Close the import dialog before changing profile settings.');
+    let action = args.trim();
+    if (!action) {
+      const a = active;
+      const info = a ? `${a.name} · ${a.memory.root.length} messages · ${a.memory.pending} pending\nCompactor: ${a.config.compactor.model} (${a.config.compactor.thinking})\nAgents: ${a.config.subagent.model} (${a.config.subagent.thinking})\n${a.memory.lastError ?? ''}` : 'No active profile';
+      action = await ctx.ui.select(`OptChat\n${info}`, ['profile', 'model', 'agents', 'instructions', 'browse', 'import']) ?? '';
+    }
+    if (action === 'import') {
+      const a = required();
+      if (!ctx.hasUI) throw new Error('/optchat import requires interactive Pi.');
+      if (!ctx.isIdle() || a.children.active || reports.length) throw new Error('Finish active work and pending reports before importing.');
+      importing = true; importController = new AbortController(); let closed = false;
+      status(ctx);
+      const signal = importController.signal;
+      importTask = (async () => {
+        let job = pendingImport(a.dir);
+        if (job) {
+          const selected = await ctx.ui.select(`Paused ${job.mode} import · ${job.added} new messages`, ['Resume import', 'Discard staged import', 'Cancel'], { signal });
+          if (selected === 'Discard staged import') {
+            if (await ctx.ui.confirm('Discard import?', 'Original memory stays unchanged. Staged summaries will be removed.', { signal })) { signal.throwIfAborted(); discardImport(a.dir); }
+            return;
+          }
+          if (selected !== 'Resume import') return;
+        } else {
+          const plan = await chooseImport(ctx, a.name, a.memory, `${a.config.compactor.provider}/${a.config.compactor.model} (${a.config.compactor.thinking})`, signal);
+          if (!plan) return;
+          signal.throwIfAborted();
+          flush(); a.inbox.recover(a.memory); await checkpoints; await a.memory.close(); closed = true;
+          signal.throwIfAborted();
+          job = prepareImport(a.dir, a.memory, plan.entries, plan.mode);
+          if (!job) return;
+        }
+        if (!closed) { await a.memory.close(); closed = true; }
+        const compress = createCompressor(ctx.modelRegistry, () => a.config.compactor, message => {
+          appendJson(join(a.dir, 'usage.jsonl'), { date: new Date().toISOString(), role: 'import', model: message.model, usage: message.usage });
+        });
+        const completed = await showProgress(ctx, job, (signal, progress) => runImport(a.dir, compress, signal, progress), signal);
+        ctx.ui.notify(completed ? `Imported ${job.added} messages into ${a.name}. Previous memory retained at ${job.previous === '.' ? a.dir : join(a.dir, job.previous)}.`
+          : 'Import paused. Use /optchat import to resume. Other profiles remain available.', 'info');
+      })();
+      let failure: unknown;
+      try { await importTask; } catch (error) { failure = error; }
+      finally { importing = false; importTask = undefined; importController = undefined; ctx.ui.setWidget('optchat-import', undefined); }
+      if (closed && !stopping) await ctx.newSession({ setup: async manager => { manager.appendCustomEntry(binding, { name: a.name }); } });
+      else status(ctx);
+      if (failure) throw failure;
+      return;
+    }
+    if (action === 'profile') {
+      if (!ctx.isIdle() || active?.children.active) throw new Error('Finish or stop active work before switching profiles.');
+      const selected = await chooseProfile(ctx);
+      if (!selected || selected === active?.name) return;
+      await ctx.newSession({ setup: async manager => { manager.appendCustomEntry(binding, { name: selected }); } });
+      return;
+    }
+    if (action === 'model') return pickModel(ctx, 'compactor');
+    if (action === 'agents') {
+      const a = required();
+      const selected = await ctx.ui.select('Background agents', ['Choose model', ...a.children.ids.map(id => `Stop ${id}`)]);
+      if (selected === 'Choose model') return pickModel(ctx, 'subagent');
+      if (selected?.startsWith('Stop ')) await a.children.stop(selected.slice(5));
+      return;
+    }
+    if (action === 'instructions') {
+      const a = required();
+      const edited = await ctx.ui.editor(`${a.name} · AGENTS.md`, instructions(a.dir));
+      if (edited !== undefined) { atomicWrite(join(a.dir, 'AGENTS.md'), edited); ctx.ui.notify('Saved. Applies to the next turn and newly spawned agents.', 'info'); }
+      return;
+    }
+    if (action === 'browse') {
+      const a = required(), file = exportBrowser(a.memory, a.name, a.dir);
+      if (ctx.hasUI) execFile(process.platform === 'darwin' ? 'open' : 'xdg-open', [file], error => { if (error) ctx.ui.notify(`Open ${file}`, 'info'); });
+      ctx.ui.notify(file, 'info'); return;
+    }
+    if (action) throw new Error('Use /optchat [profile|model|agents|instructions|browse|import].');
+  };
+  pi.registerCommand('optchat', { description: 'OptChat profiles, models, agents, instructions, memory browser, and imports',
+    getArgumentCompletions: prefix => ['profile', 'model', 'agents', 'instructions', 'browse', 'import'].filter(s => s.startsWith(prefix)).map(value => ({ value, label: value })),
+    handler: async (args, ctx) => { try { await command(args, ctx); } catch (error) { ctx.ui.notify(errorText(error), 'error'); } },
+  });
+}
