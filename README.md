@@ -22,6 +22,8 @@ Compression and background agents make additional model requests using your conf
 | --- | --- |
 | `/optchat` | Show status and the actions menu. |
 | `/optchat profile` | Select or create a profile; switching starts a fresh Pi session. |
+| `/complete` | End a connected-window conversation and send a handoff to the main agent. |
+| `/tell-main <message>` | Send the main agent a message from a connected window. |
 | `/optchat model` | Select this profile's compactor model and effort. |
 | `/optchat agents` | Open the live agent tree and saved run history. |
 | `/optchat agents model` | Select this profile's subagent model and effort, independently of the main model. |
@@ -78,11 +80,25 @@ Both modes build in a separate memory generation. The active-memory pointer chan
 - `runs/`: child Pi sessions and `*.optchat.json` run metadata; `usage.jsonl`: usage ledger for all roles; `memory.html`: browser snapshot.
 - Pi also retains its native sessions in Pi's normal session directory.
 
-The extension takes an exclusive lock per profile. You can run work and personal simultaneously, but two Pi processes cannot write the same profile. Resuming a Pi session restores its bound profile. New sessions offer the picker with the last-used profile first. For headless use, pass `--optchat-profile work`; this does not permit resuming a session bound to a different profile.
+The extension takes an exclusive lock per profile. You can run work and personal simultaneously, but two Pi processes cannot write the same profile. A second interactive window offers to connect to the original window as a subagent (see below). Resuming a Pi session restores its bound profile. New sessions offer the picker with the last-used profile first. For headless use, pass `--optchat-profile work`; this does not permit resuming a session bound to a different profile or attaching as a connected window.
 
 These profiles separate memory and instructions, not filesystem access or provider credentials. Agents retain normal Pi tool access. Jobs run in the Pi process: keep it open for background work. On restart, unsent inputs are recovered into memory and you can ask to continue them; completed pending child reports are delivered automatically. Interrupted children are not automatically restarted.
 
 Local Git checkpoints are made after parent turns and on clean shutdown. They include memory and configuration, excluding child runs, rendered HTML, and usage logs. They have no remote and are not an off-machine backup. Copy the full profile directory while Pi is closed if you want a separate backup.
+
+## Connected agent windows
+
+Open Pi in another terminal and select the same profile. Pi identifies the original owner and asks whether to start a connected subagent conversation. Your first message starts one child in the second window's working directory; subsequent messages continue that conversation. Responses appear in the transcript, with current activity above the editor. The child also appears in the original window's agent inspector. Text input is supported; for images, provide a file path for the agent to read.
+
+The original Pi process hosts the child and remains the only writer of shared memory. The child uses the profile's subagent model and normal delegation limits (including two more levels), and stays alive between replies. An open connected conversation occupies one of the eight agent slots and prevents profile switching/importing in the owner until it ends. Its transcript and user guidance are saved continuously.
+
+Communication has three parts: the main agent receives the initial request when the conversation starts; either side can communicate explicitly during work; and the owner always prepares a final handoff when it ends. Use `/tell-main <message>` to contact the main agent yourself. The child has a `tell_main` tool, and the main agent can reply through its existing `tell` tool. Those replies appear in the connected window as labelled main-agent guidance. Routine conversation turns do not repeatedly wake the main agent. Notifications are journaled and wake an idle main agent or enter its running conversation through Pi's steering mechanism.
+
+Use **`/complete`** when you are done. It records your decision, closes the secondary Pi session, and asks the owner to stop remaining work (including descendants) and prepare the handoff asynchronously. Completion refers to the conversation ending, not proof that every task succeeded. Closing or force-quitting the secondary window also stops its work and generates a handoff, explicitly marked **interrupted**. There is no detach-and-keep-working or reattach mode in this version.
+
+Handoffs use the profile's compactor model and effort with a dedicated prompt, rather than the 512-byte memory-summary limit. Long transcripts are folded in chunks, preserving user decisions/corrections, changes, evidence, failures, and unfinished work. The handoff links to the full saved transcript; private reasoning and the initial memory snapshot are excluded. Usage appears under compactor usage. If summarization fails or a call times out, a clearly labelled fallback still reports the initial task, last recorded result, undelivered guidance, and transcript location.
+
+Keep the original Pi window open to host the agents. Graceful owner shutdown stops the conversations and saves their handoffs for next startup. If the owner is killed, opening that profile again recovers unfinished conversations and undelivered handoffs without restarting their work. The connection is local to this machine through a socket restricted to the same OS user; there is no new daemon or remote server. Parallel agents retain shared filesystem access—use separate Git worktrees for independent edits when needed.
 
 ## How closely this follows the recipe
 
