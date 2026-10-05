@@ -151,7 +151,7 @@ export class Children {
       }
     } catch (error) {
       for (const child of launched) {
-        child.session.dispose(); this.running.delete(child.info.id);
+        this.dispose(child.session); this.running.delete(child.info.id);
         child.info.state = 'failed'; child.info.ended = Date.now(); child.info.report = `Launch failed: ${String(error)}`;
         if (child.info.connected) child.info.handoff = { reason: signal?.aborted ? 'disconnected' : 'failed' };
         this.save(child.info);
@@ -199,6 +199,9 @@ export class Children {
       },
     };
   }
+  private dispose(session: AgentSession) {
+    try { session.dispose(); } catch (error) { this.warn(`Subagent cleanup failed: ${String(error)}`); }
+  }
   private directChildren(id: string) { return [...this.running.values()].filter(c => c.info.parentId === id); }
   private async execute(live: LiveRun, view: string) {
     const { session, info } = live;
@@ -240,7 +243,8 @@ export class Children {
       for (const g of info.guidance) if (g.state === 'queued') g.state = 'undelivered';
       try { await session.extensionRunner.emit({ type: 'session_shutdown', reason: 'quit' }); }
       catch (error) { this.warn(`Subagent cleanup failed: ${String(error)}`); }
-      finally { session.dispose(); this.running.delete(info.id); }
+      // A failed dispose must neither keep the slot taken nor drop the report below.
+      this.dispose(session); this.running.delete(info.id);
     }
     if (info.connected) {
       info.handoff ??= { reason: 'failed' };

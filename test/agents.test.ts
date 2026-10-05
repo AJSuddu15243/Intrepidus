@@ -234,3 +234,74 @@ test('children can message their parent mid-run: the main agent, an idle parent,
     assert.deepEqual(warnings, []);
   } finally { for (const release of releases.values()) release(); await children.close(); await memory.close(); rmSync(dir, { recursive: true, force: true }); }
 });
+
+test('a child that fails to clean up still reports, is disposed, and frees its slot', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'optchat-cleanup-'));
+  const memory = new Memory(dir, async input => input.source.slice(0, 100), () => {});
+  const reports: string[] = [], warnings: string[] = [], releases = new Map<string, () => void>();
+  const runtime = await ModelRuntime.create({ authPath: join(dir, 'auth.json'), modelsPath: null, modelsStorePath: join(dir, 'models-cache.json'), refreshOnCreate: false });
+  runtime.registerProvider('optchat-test', {
+    baseUrl: 'https://invalid.local', apiKey: 'synthetic', api: 'openai-completions',
+    models: [{ id: 'child', name: 'Synthetic child', reasoning: false, input: ['text'], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 100000, maxTokens: 1000 }],
+    streamSimple(model, context, options) {
+      const stream = createAssistantMessageEventStream();
+      const task = textContent(context.messages.find(m => m.role === 'user')?.content).split('Your task:\n').at(-1) ?? '';
+      const last = context.messages.at(-1);
+      const first = context.messages.filter(m => m.role === 'assistant').length === 0;
+      const message: AssistantMessage = { role: 'assistant', content: [{ type: 'text', text: first ? `${task} done` : `${task} heard: ${textContent(last && 'content' in last ? last.content : '')}` }],
+        api: model.api, provider: model.provider, model: model.id, timestamp: Date.now(), stopReason: 'stop', usage: emptyUsage() };
+      void (async () => {
+        stream.push({ type: 'start', partial: message });
+        // Hold each first turn so the test can break the child's cleanup before it finishes.
+        if (first) await new Promise<void>(resolve => {
+          releases.set(task, resolve); options?.signal?.addEventListener('abort', () => resolve(), { once: true });
+          if (options?.signal?.aborted) resolve();
+        });
+        stream.push({ type: 'done', reason: 'stop', message });
+        stream.end();
+      })();
+      return stream;
+    },
+  });
+  const children = new Children(memory, new ModelRegistry(runtime), () => ({ provider: 'optchat-test', model: 'child', thinking: 'minimal' }), () => '',
+    async text => { reports.push(text); }, text => warnings.push(text), dir, { createSession: options => createAgentSession({ ...options, modelRuntime: runtime }) });
+  const breakDispose = (id: string) => {
+    const session = children.live(id)!.session, dispose = session.dispose.bind(session);
+    session.dispose = () => { dispose(); throw new Error('dispose failed'); };
+  };
+  try {
+    // A throwing session_shutdown hook must not skip dispose; a throwing dispose must not drop the report.
+    const [hook, disposal] = await children.spawn([{ task: 'hook' }, { task: 'disposal' }], dir);
+    await until(() => releases.has('hook') && releases.has('disposal'));
+    const hookSession = children.live(hook)!.session, dispose = hookSession.dispose.bind(hookSession);
+    let disposed = false;
+    const emit = hookSession.extensionRunner.emit.bind(hookSession.extensionRunner);
+    hookSession.extensionRunner.emit = (async (event: Parameters<typeof emit>[0]) => {
+      if (event.type === 'session_shutdown') throw new Error('shutdown hook failed');
+      return emit(event);
+    }) as typeof emit;
+    hookSession.dispose = () => { disposed = true; dispose(); };
+    breakDispose(disposal);
+    releases.get('hook')!(); releases.get('disposal')!();
+    await until(() => !children.active);
+    assert.ok(disposed, 'the child is disposed even when its shutdown hook throws');
+    assert.deepEqual(reports.toSorted(), [`[${disposal}] disposal done`, `[${hook}] hook done`].toSorted());
+    for (const id of [hook, disposal]) assert.equal(children.history.records.get(id)?.state, 'completed');
+    assert.equal(children.live(disposal), undefined, 'a failed dispose still frees the agent slot');
+
+    // A nested child whose dispose throws still reaches its waiting parent, which then finishes.
+    const [boss] = await children.spawn([{ task: 'boss' }], dir);
+    const [worker] = await children.spawn([{ task: 'worker' }], dir, undefined, boss);
+    await until(() => releases.has('boss') && releases.has('worker'));
+    breakDispose(worker);
+    releases.get('boss')!();
+    await until(() => children.history.records.get(boss)?.state === 'waiting');
+    releases.get('worker')!();
+    await until(() => !children.active);
+    assert.equal(reports.at(-1), `[${boss}] boss heard: [${worker}] worker done`);
+    assert.equal(children.history.records.get(boss)?.state, 'completed');
+    assert.deepEqual(warnings.toSorted(), [
+      'Subagent cleanup failed: Error: dispose failed', 'Subagent cleanup failed: Error: dispose failed', 'Subagent cleanup failed: Error: shutdown hook failed',
+    ]);
+  } finally { for (const release of releases.values()) release(); await children.close(); await memory.close(); rmSync(dir, { recursive: true, force: true }); }
+});
