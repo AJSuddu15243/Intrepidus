@@ -181,7 +181,7 @@ To delete a profile, delete its folder. Your original Pi sessions are kept in Pi
 - **Images** are available during the current run but stored in memory as text placeholders.
 - **Pi's auto-compaction is off.** A single very long run can still hit the model's context limit; stop it and continue in a new turn.
 - **Restarts**: unsent inputs are recovered into memory, and pending subagent reports are delivered. Interrupted subagents are not restarted.
-- **Skill and template inputs** can occasionally be recovered as an unanswered input after a crash, because Pi expands them after the input journal records them. Plain text chat is unaffected.
+- **Prompt-template inputs** can be saved twice: expanded, and later in their original form as an unanswered input, because Pi expands them after the input journal records them. Skill commands (`/skill:name`) are matched back to their journaled input and don't have this problem. Plain text chat is unaffected.
 
 ## How it differs from the recipe
 

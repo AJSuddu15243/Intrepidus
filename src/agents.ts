@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
-import { existsSync, readFileSync } from 'node:fs';
-import { join, dirname } from 'node:path';
+import { existsSync, readFileSync, statSync } from 'node:fs';
+import { join, dirname, resolve } from 'node:path';
+import { homedir } from 'node:os';
 import { createAgentSession, DefaultResourceLoader, SessionManager, SettingsManager, getAgentDir, type AgentSession, type AgentSessionEvent, type ModelRegistry } from '@earendil-works/pi-coding-agent';
 import type { AgentMessage } from '@earendil-works/pi-agent-core';
 import { SUBAGENT, VIEW_DOC } from './prompts.ts';
@@ -28,10 +29,16 @@ const packageName = (path: string): string | undefined => {
   for (let dir = dirname(path); dir !== dirname(dir); dir = dirname(dir)) {
     const manifest = join(dir, 'package.json');
     if (!existsSync(manifest)) continue;
-    const data: unknown = JSON.parse(readFileSync(manifest, 'utf8'));
-    return data && typeof data === 'object' && 'name' in data && typeof data.name === 'string' ? data.name : undefined;
+    try {
+      const data: unknown = JSON.parse(readFileSync(manifest, 'utf8'));
+      return data && typeof data === 'object' && 'name' in data && typeof data.name === 'string' ? data.name : undefined;
+    } catch { return undefined; } // A broken manifest is not OptChat's and must not block every spawn.
   }
 };
+/** A task's cwd may start with `~` and may be relative to the spawning agent's directory. */
+export const taskDirectory = (cwd: string, path = '.', windows = process.platform === 'win32') =>
+  resolve(cwd, path.replace(windows ? /^~(?=$|[\\/])/ : /^~(?=$|\/)/, homedir()));
+export const CWD_DOC = 'Project directory the subagent works in (~ allowed); its AGENTS.md files load from there. Defaults to your current directory.';
 const isOptchat = (path: string) => packageName(path) === 'pi-optchat';
 export class Children {
   private readonly running = new Map<string, LiveRun>();
@@ -92,6 +99,7 @@ export class Children {
     } catch (error) { this.warn(`Could not record subagent activity: ${String(error)}`); }
   }
   async spawn(tasks: { task: string; cwd?: string }[], cwd: string, signal?: AbortSignal, parentId?: string, connected = false) {
+    for (const directory of tasks.map(t => taskDirectory(cwd, t.cwd))) if (!existsSync(directory) || !statSync(directory).isDirectory()) throw new Error(`No such directory: ${directory}`);
     if (this.closing) throw new Error('Profile is closing.');
     this.settling++;
     try { await this.memory.settle(signal); } finally { this.settling--; }
@@ -113,7 +121,7 @@ export class Children {
       for (const task of tasks) {
         signal?.throwIfAborted();
         if (cancelled()) throw new Error('Parent or profile is stopping.');
-        const id = randomUUID().slice(0, 8), directory = task.cwd ?? cwd;
+        const id = randomUUID().slice(0, 8), directory = taskDirectory(cwd, task.cwd);
         const delegation = depth < 3 ? 'You may delegate parts of your assigned task with spawn when useful. Child reports arrive automatically after your current run ends; the harness keeps you alive to receive them. Never poll, sleep, or wait in a tool for children. Finish your current work and return; you will be prompted with their results. The profile allows 8 active agents total.' : 'You are at the maximum delegation depth. Complete your task with your own tools.';
         const instructions = [this.instructions(), delegation, connected ? 'You are speaking directly with the user in a connected window. Continue this conversation across requests. Use tell_parent for questions or findings the main agent needs now. A handoff will be generated when the user completes or disconnects the window.'
           : 'Use tell_parent only when your parent needs something now (a blocking question, an important early finding, or when asked to). Your final answer is delivered automatically; do not repeat it with tell_parent.'].filter(Boolean).join('\n\n');
@@ -171,7 +179,7 @@ export class Children {
   }
   private delegationTools(parentId: string, cwd: string) {
     return [{ name: 'spawn', label: 'Delegate task', description: 'Delegate parts of your task. Results arrive automatically after this run; never poll or sleep waiting. Maximum depth 3 and 8 active agents per profile.',
-      parameters: Type.Object({ tasks: Type.Array(Type.Object({ task: Type.String(), cwd: Type.Optional(Type.String()) }), { minItems: 1, maxItems: 8 }) }),
+      parameters: Type.Object({ tasks: Type.Array(Type.Object({ task: Type.String(), cwd: Type.Optional(Type.String({ description: CWD_DOC })) }), { minItems: 1, maxItems: 8 }) }),
       execute: async (_id: string, args: { tasks: { task: string; cwd?: string }[] }, signal?: AbortSignal) => result(`Started: ${(await this.spawn(args.tasks, cwd, signal, parentId)).join(', ')}. Results will arrive automatically.`),
     }, { name: 'tell', label: 'Guide child', description: 'Send guidance to one of your direct children.',
       parameters: Type.Object({ id: Type.String(), message: Type.String() }),
