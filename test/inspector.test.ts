@@ -7,7 +7,7 @@ import { ModelRegistry, ModelRuntime, SessionManager } from '@earendil-works/pi-
 import { visibleWidth } from '@earendil-works/pi-tui';
 import { Children } from '../src/agents.ts';
 import { Memory } from '../src/memory.ts';
-import { Inspector } from '../src/inspector.ts';
+import { fit, Inspector } from '../src/inspector.ts';
 import { emptyUsage, UsageLedger } from '../src/usage.ts';
 import { RunHistory } from '../src/runs.ts';
 
@@ -30,7 +30,7 @@ test('inspector reaches old runs, preserves selection on return, scrolls transcr
   const inspector = new Inspector({ profile: 'personal', session: 'parent', children, usage, page: 'agents', rows: () => rows, redraw: () => {}, done: () => { finished++; }, color: (_tone, text) => text, context: () => 123, signal: controller.signal });
   try {
     inspector.handleInput('\x1b[F');
-    assert.match(inspector.render(100).find(l => l.startsWith('→')) ?? '', /Task 99/);
+    assert.match(inspector.render(100).find(l => l.startsWith(' →')) ?? '', /Task 99/);
     inspector.handleInput('\r');
     assert.match(inspector.render(100).join('\n'), /Transcript line 99/);
     inspector.handleInput('\x1b[H');
@@ -40,7 +40,7 @@ test('inspector reaches old runs, preserves selection on return, scrolls transcr
     inspector.handleInput('f');
     assert.match(inspector.render(100).join('\n'), /Transcript line 99/);
     inspector.handleInput('\x1b');
-    assert.match(inspector.render(100).find(l => l.startsWith('→')) ?? '', /Task 99/);
+    assert.match(inspector.render(100).find(l => l.startsWith(' →')) ?? '', /Task 99/);
     inspector.handleInput('\t'); inspector.handleInput('\x1b[C');
     assert.match(inspector.render(100).join('\n'), /Last hour/);
     rows = 16;
@@ -61,4 +61,10 @@ test('unfinished persisted runs recover as interrupted with undelivered guidance
     assert.equal(restored?.state, 'interrupted');
     assert.equal(restored?.guidance[0].state, 'undelivered');
   } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('agent titles shorten at a word boundary with an ellipsis', () => {
+  assert.equal(fit('Read-only review of PR #7 in jonaslsaa/pi-optchat', 30), 'Read-only review of PR #7 in…');
+  assert.equal(fit('github.com/jonaslsaa/pi-optchat/pull/7', 12), 'github.com/…');
+  assert.equal(fit('review #6', 30), 'review #6');
 });

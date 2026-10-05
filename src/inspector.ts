@@ -1,4 +1,4 @@
-import { Input, matchesKey, truncateToWidth, wrapTextWithAnsi, type Component, type Focusable } from '@earendil-works/pi-tui';
+import { Input, matchesKey, sliceByColumn, truncateToWidth, visibleWidth, wrapTextWithAnsi, type Component, type Focusable } from '@earendil-works/pi-tui';
 import type { ExtensionContext } from '@earendil-works/pi-coding-agent';
 import type { AgentMessage } from '@earendil-works/pi-agent-core';
 import type { Children } from './agents.ts';
@@ -11,11 +11,24 @@ export const clean = (text: string) => text.replace(/[\x00-\x08\x0b-\x1f\x7f-\x9
 export const oneLine = (text: string) => clean(text).replace(/\n/g, ' ');
 export const count = (n: number) => n.toLocaleString('en-US');
 export const elapsed = (ms: number) => ms < 60_000 ? `${Math.max(0, Math.floor(ms / 1000))}s` : `${Math.floor(ms / 60_000)}m ${Math.floor(ms / 1000) % 60}s`;
+/** Shortens plain text with an ellipsis, preferring a word boundary. */
+export function fit(text: string, width: number) {
+  if (visibleWidth(text) <= width) return text;
+  if (width < 2) return sliceByColumn(text, 0, width, true);
+  const cut = sliceByColumn(text, 0, width - 1, true), space = cut.lastIndexOf(' '); // Unlike truncateToWidth, adds no style reset.
+  return `${(space > cut.length * 0.6 ? cut.slice(0, space) : cut).trimEnd()}…`;
+}
+/** Left text and right text on one line, the right side flush with the edge when both fit. */
+const spread = (left: string, right: string, width: number) => {
+  const gap = width - visibleWidth(left) - visibleWidth(right);
+  return gap >= 2 ? `${left}${' '.repeat(gap)}${right}` : left;
+};
 export type InspectorPage = 'agents' | 'usage';
+type Tone = 'accent' | 'muted' | 'dim' | 'error' | 'border';
 interface Options {
   profile: string; session: string; children: Children; usage: UsageLedger; page: InspectorPage;
   rows: () => number; redraw: () => void; done: (action?: 'model') => void;
-  color: (tone: 'accent' | 'dim' | 'error', text: string) => string;
+  color: (tone: Tone, text: string) => string;
   context: () => number | null | undefined;
   refreshUsage?: () => void;
   signal?: AbortSignal;
@@ -30,6 +43,7 @@ export class Inspector implements Component, Focusable {
   private top = 0;
   private scroll = 0;
   private lineCount = 0;
+  private hintLines = 1;
   private follow = true;
   private details = false;
   private range: UsageRange = 'This session';
@@ -55,7 +69,8 @@ export class Inspector implements Component, Focusable {
     this.ended = true; clearInterval(this.timer); this.unsubscribe(); this.options.signal?.removeEventListener('abort', this.abort);
   }
   invalidate() { this.composer?.invalidate(); }
-  private get height() { return Math.max(1, Math.floor(this.options.rows() * 0.9) - (this.composer ? 9 : 7)); }
+  /** Body rows left after the rules, title, hint, spacing and composer; the rest of the screen keeps the footer visible. */
+  private get height() { return Math.max(1, Math.floor(this.options.rows() * 0.8) - (this.composer ? 7 : 6) - (this.hintLines - 1)); }
   private select(delta: number) {
     const list = this.options.children.history.list();
     const index = Math.max(0, list.findIndex(r => r.id === this.selected));
@@ -178,17 +193,18 @@ export class Inspector implements Component, Focusable {
   }
   render(width: number): string[] {
     const { color, children, profile } = this.options;
+    const inner = Math.max(1, width - 2);
     const inspected = this.opened ? children.history.records.get(this.opened) : undefined;
-    const header = color('accent', `OptChat · ${profile} · ${inspected ? `${inspected.state}: ${oneLine(inspected.task)}` : this.page === 'usage' ? 'Usage' : 'Agents'}`);
-    let body: string[], hint: string;
+    let title = `OptChat · ${profile} · ${inspected ? `${inspected.state}: ${oneLine(inspected.task)}` : this.page === 'usage' ? 'Usage' : 'Agents'}`;
+    let info: string, body: string[], hint: string;
     if (this.page === 'usage' || this.opened) {
       const run = this.opened ? children.history.records.get(this.opened) : undefined;
       const text = this.page === 'usage' ? this.usageLines() : run ? `${run.state} · ${elapsed((run.ended ?? Date.now()) - run.started)} · ${run.id}\n\n${this.transcript(run)}` : 'Run unavailable.';
-      const lines = wrapTextWithAnsi(clean(text), Math.max(1, width)); this.lineCount = lines.length;
+      const lines = wrapTextWithAnsi(clean(text), inner); this.lineCount = lines.length;
       if (this.opened && this.follow) this.scroll = Math.max(0, lines.length - this.height);
       this.scroll = Math.max(0, Math.min(this.scroll, lines.length - this.height));
       body = lines.slice(this.scroll, this.scroll + this.height);
-      body.push(color('dim', `${this.scroll + 1}–${Math.min(this.scroll + this.height, lines.length)} / ${lines.length}${this.opened ? this.follow ? ' · following' : ' · scroll paused (f follows)' : ''}`));
+      info = `${this.scroll + 1}–${Math.min(this.scroll + this.height, lines.length)} / ${lines.length}${this.opened ? this.follow ? ' · following' : ' · scroll paused' : ''}`;
       hint = this.page === 'usage' ? '←→ period · ↑↓/PgUp/PgDn scroll · Tab agents · Esc close' : '↑↓/PgUp/PgDn scroll · t tools · f follow · s message · x stop tree · Esc back';
     } else {
       const list = children.history.list();
@@ -197,24 +213,47 @@ export class Inspector implements Component, Focusable {
       this.top = Math.max(0, Math.min(this.top, list.length - this.height));
       if (cursor < this.top) this.top = cursor;
       if (cursor >= this.top + this.height) this.top = cursor - this.height + 1;
-      body = list.slice(this.top, this.top + this.height).map(run => {
+      const rows = list.slice(this.top, this.top + this.height).map(run => {
         const live = children.live(run.id), tools = live ? [...live.tools.values()].map(t => t.name).join(', ') : '';
-        const activity = live ? `${run.state === 'stopping' ? 'stopping' : run.state === 'waiting' ? 'waiting for children' : tools || (live.streaming ? 'responding' : 'working')} · last activity ${elapsed(Date.now() - live.updated)} ago` : run.state;
-        const label = `${run.id === this.selected ? '→' : ' '} ${'  '.repeat(run.depth - 1)}${run.parentId ? '↳ ' : ''}${oneLine(run.task).slice(0, 55)} · ${activity} · ${elapsed((run.ended ?? Date.now()) - run.started)}`;
-        return run.id === this.selected ? color('accent', label) : label;
+        const status = live ? `${run.state === 'stopping' ? 'stopping' : run.state === 'waiting' ? 'waiting for children' : tools || (live.streaming ? 'responding' : 'working')} · ${elapsed(Date.now() - live.updated)} ago` : run.state;
+        return { run, task: `${'  '.repeat(run.depth - 1)}${run.parentId ? '↳ ' : ''}${oneLine(run.task)}`, status, time: elapsed((run.ended ?? Date.now()) - run.started) };
       });
-      if (!body.length) body.push('No agents yet. Ask the main agent to delegate a task.');
-      body.push(color('dim', `${list.filter(isActiveRun).length} active · ${list.length} saved · ${list.length ? cursor + 1 : 0}/${list.length}`));
+      // Columns: task (flexible) · status · duration (right-aligned); status yields first on narrow screens.
+      const timeWidth = Math.max(0, ...rows.map(r => r.time.length));
+      let statusWidth = Math.min(Math.max(0, ...rows.map(r => visibleWidth(r.status))), Math.floor(inner * 0.4));
+      if (inner - 2 - statusWidth - timeWidth - 4 < 12) statusWidth = 0;
+      const taskWidth = Math.max(1, inner - 2 - timeWidth - 2 - (statusWidth ? statusWidth + 2 : 0));
+      body = rows.map(({ run, task, status, time }) => {
+        const selected = run.id === this.selected;
+        const name = truncateToWidth(fit(task, taskWidth), taskWidth, '', true);
+        const meta = `${statusWidth ? `${truncateToWidth(fit(status, statusWidth), statusWidth, '', true)}  ` : ''}${time.padStart(timeWidth)}`;
+        return selected ? color('accent', `→ ${name}  ${meta}`) : `  ${name}  ${color('muted', meta)}`;
+      });
+      if (!body.length) body.push(color('muted', 'No agents yet. Ask the main agent to delegate a task.'));
+      info = `${list.filter(isActiveRun).length} active · ${list.length} saved${list.length ? ` · ${cursor + 1}/${list.length}` : ''}`;
       hint = '↑↓ select · Enter inspect · m model · Tab usage · Esc close';
     }
-    if (this.composer) { this.composer.focused = this.focused; body.push(...this.composer.render(width)); hint = 'Enter sends guidance · Esc cancels message'; }
-    return [header, '', ...body, '', color(this.error ? 'error' : 'dim', this.error || (this.busy ? 'Updating agent…' : hint))].map(line => truncateToWidth(line, width));
+    if (this.composer) { this.composer.focused = this.focused; body.push(...this.composer.render(inner)); hint = 'Enter sends guidance · Esc cancels message'; }
+    title = fit(title, Math.max(1, inner - visibleWidth(info) - 2));
+    const footer = wrapTextWithAnsi(this.error || (this.busy ? 'Updating agent…' : hint), inner).map(line => color(this.error ? 'error' : 'dim', line));
+    this.hintLines = footer.length;
+    const rule = color('border', '─'.repeat(Math.max(1, width)));
+    // Same layout as Pi's own selectors: rules above and below, content indented by one column.
+    const content = [spread(color('accent', title), color('dim', info), inner), '', ...body, '', ...footer].map(line => ` ${truncateToWidth(line, inner, '…')}`);
+    return [rule, ...content, rule].map(line => truncateToWidth(line, width));
   }
 }
 
+let showing = false;
+/** True while the panel is on screen; cleared before Pi restores the editor so the agent bar returns in the same frame. */
+export const inspectorShowing = () => showing;
+/** Takes the editor's place, like Pi's own selectors; Pi restores the editor and its draft on close. */
 export function showInspector(ctx: ExtensionContext, options: Omit<Options, 'rows' | 'redraw' | 'done' | 'color' | 'context'>) {
-  return ctx.ui.custom<'model' | undefined>((tui, theme, _keys, done) => new Inspector({ ...options,
-    rows: () => tui.terminal.rows, redraw: () => tui.requestRender(), done,
-    color: (tone, text) => theme.fg(tone, text), context: () => ctx.getContextUsage()?.tokens,
-  }), { overlay: true, overlayOptions: { width: '96%', maxHeight: '90%', anchor: 'center' } });
+  return ctx.ui.custom<'model' | undefined>((tui, theme, _keys, done) => {
+    showing = true;
+    return new Inspector({ ...options,
+      rows: () => tui.terminal.rows, redraw: () => tui.requestRender(), done: action => { showing = false; done(action); },
+      color: (tone, text) => theme.fg(tone, text), context: () => ctx.getContextUsage()?.tokens,
+    });
+  });
 }
