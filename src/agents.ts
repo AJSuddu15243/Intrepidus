@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { existsSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createAgentSession, DefaultResourceLoader, SessionManager, SettingsManager, getAgentDir, type AgentSession, type AgentSessionEvent, type ModelRegistry } from '@earendil-works/pi-coding-agent';
@@ -280,9 +281,11 @@ export class Children {
         if (!this.options.summarizeHandoff) throw new Error('No handoff summarizer configured');
         summary = await this.options.summarizeHandoff(run, this.messages(run.id));
       } catch (error) {
-        summary = `Automatic summary unavailable: ${String(error)}\nInitial request: ${run.task}\nLast recorded result: ${run.report ?? 'No final answer recorded.'}\nUndelivered guidance: ${run.guidance.filter(g => g.state === 'undelivered').map(g => g.text).join('\n')}\nRead the saved transcript for the full work and user corrections.`;
+        summary = `Automatic summary unavailable: ${String(error)}\nInitial request: ${run.task}\nLast recorded result: ${run.report ?? 'No final answer recorded.'}\nUndelivered guidance: ${run.guidance.filter(g => g.state === 'undelivered').map(g => g.text).join('\n')}\nRead the saved transcript or run metadata for the full work and user corrections.`;
       }
-      handoff.text = `[${run.id}] Connected conversation ${handoff.reason === 'complete' ? 'completed by user' : `interrupted (${handoff.reason})`}. This describes the conversation ending, not proof that every task succeeded.\n${summary}\nFull transcript: ${run.sessionFile ?? 'unavailable'}`;
+      const source = run.sessionFile && existsSync(run.sessionFile) ? `Full transcript: ${run.sessionFile}`
+        : `No transcript was created. Run metadata: ${join(this.profileDirectory, 'runs', `${run.id}.optchat.json`)}`;
+      handoff.text = `[${run.id}] Connected conversation ${handoff.reason === 'complete' ? 'completed by user' : `interrupted (${handoff.reason})`}. This describes the conversation ending, not proof that every task succeeded.\n${summary}\n${source}`;
       run.report = handoff.text; this.save(run);
     }
     await this.report(handoff.text, true);
