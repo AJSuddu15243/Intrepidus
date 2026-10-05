@@ -4,7 +4,8 @@ import { mkdtempSync, rmSync, unlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawn } from 'node:child_process';
-import { createAgentSession, ModelRegistry, ModelRuntime, type ExtensionAPI, type ExtensionContext } from '@earendil-works/pi-coding-agent';
+import { createAgentSession, CustomMessageComponent, initTheme, ModelRegistry, ModelRuntime, type ExtensionAPI, type ExtensionContext, type MessageRenderer, type Theme } from '@earendil-works/pi-coding-agent';
+import { TuiMainScreen, type Component, type Terminal } from '@earendil-works/pi-tui';
 import { createAssistantMessageEventStream, type AssistantMessage } from '@earendil-works/pi-ai';
 import { Children } from '../src/agents.ts';
 import { Memory } from '../src/memory.ts';
@@ -12,7 +13,7 @@ import { emptyUsage, UsageLedger } from '../src/usage.ts';
 import { textContent } from '../src/transcript.ts';
 import { serveWindows, connectWindow, type WindowEvent } from '../src/window-bridge.ts';
 import { profileSocket, lockProfile, createProfile, profilePath } from '../src/profiles.ts';
-import { openConnectedWindow } from '../src/connected-window.ts';
+import { openConnectedWindow, registerConnectedRenderer } from '../src/connected-window.ts';
 import { createHandoffSummarizer } from '../src/handoff.ts';
 
 // Children load installed extensions from Pi's agent dir; keep tests away from the user's real one.
@@ -52,13 +53,20 @@ async function fixture(contextWindow = 1_000_000, maxTokens = 64_000) {
         message.content = [{ type: 'toolCall', id: 'evidence', name: 'bash', arguments: { command: "printf 'DESCENDANT_TESTS_PASSED_123\\n'" } }];
       }
       if (summary && control.failSummary) { message.stopReason = 'error'; message.errorMessage = 'Synthetic summarizer unavailable'; }
+      if (text === 'spawn one') {
+        message.content = [{ type: 'toolCall', id: 'spawn-one', name: 'spawn', arguments: { tasks: [{ task: 'hold work descendant' }] } }];
+        message.stopReason = 'toolUse';
+      }
       if (text === 'ask main') {
         message.content = [{ type: 'toolCall', id: 'tell-main', name: 'tell_parent', arguments: { message: 'Need a decision from the main agent.' } }];
         message.stopReason = 'toolUse';
       }
       void (async () => {
         stream.push({ type: 'start', partial: message });
-        if (!summary && (text.includes('hold work') || last?.role === 'toolResult' && text.includes('DESCENDANT_TESTS_PASSED_123'))) await new Promise<void>(resolve => {
+        const hold = !summary && (text.includes('hold work') || last?.role === 'toolResult' && text.includes('DESCENDANT_TESTS_PASSED_123'));
+        // A held reply is mid-stream, as a real one would be while the model is still writing.
+        if (hold) stream.push({ type: 'text_delta', contentIndex: 0, delta: 'Reply', partial: message });
+        if (hold) await new Promise<void>(resolve => {
           if (options?.signal?.aborted) resolve(); else options?.signal?.addEventListener('abort', () => resolve(), { once: true });
         });
         if (message.stopReason === 'error') stream.push({ type: 'error', reason: 'error', error: message });
@@ -122,6 +130,96 @@ test('connected window keeps one real SDK conversation, communicates both ways, 
     assert.equal(f.summaries.length, 1, 'delivered handoffs must not be repeated');
     assert.deepEqual(f.warnings, []);
   } finally { client.close(); await close(); await f.close(); }
+});
+
+test('connected window receives the real tool calls, results and live state, so it can draw them like Pi', async () => {
+  const f = await fixture();
+  const events: WindowEvent[] = [];
+  const close = await serveWindows(f.dir, f.children, () => true, async text => { f.reports.push(text); });
+  const client = await connectWindow(f.dir, event => events.push(event), () => {});
+  try {
+    await client.request('start', 'descendant-evidence-task', f.dir);
+    const id = events.find(e => e.name === 'started')?.text; assert.ok(id);
+    // The fake model calls bash, then holds its next reply open, so the window sees a streaming reply.
+    await until(() => events.some(e => e.message?.role === 'toolResult'));
+    const call = events.find(e => e.message?.role === 'assistant')?.message;
+    assert.ok(call?.role === 'assistant' && call.content.some(p => p.type === 'toolCall' && p.name === 'bash' && p.id === 'evidence'));
+    const result = events.find(e => e.message?.role === 'toolResult')?.message;
+    assert.ok(result?.role === 'toolResult' && result.toolCallId === 'evidence' && textContent(result.content).includes('DESCENDANT_TESTS_PASSED_123'));
+    await until(() => events.some(e => e.live?.streaming));
+    const live = events.findLast(e => e.live)?.live;
+    assert.equal(live?.state, 'running'); assert.equal(live?.model, 'window-test/child');
+    await f.children.spawn([{ task: 'hold work descendant' }], f.dir, undefined, id);
+    await until(() => events.some(e => e.live?.agents === 1));
+  } finally { client.close(); await close(); await f.close(); }
+});
+
+initTheme('dark', false);
+class OffscreenTerminal implements Terminal {
+  start() {} stop() {} async drainInput() {} write() {}
+  get columns() { return 100; } get rows() { return 30; } get kittyProtocolActive() { return false; }
+  moveBy() {} hideCursor() {} showCursor() {} clearLine() {} clearFromCursor() {} clearScreen() {} setTitle() {} setProgress() {}
+}
+const plain = (lines: string[]) => lines.join('\n').replace(/\x1b\[[0-9;:]*[A-Za-z]|\x1b[\]_][^\x07\x1b]*(\x07|\x1b\\)/g, '');
+
+test('a connected window draws each reply with its tool results, the live turn, and Working vs Waiting for N agents', async () => {
+  const f = await fixture();
+  const oldHome = process.env.OPTCHAT_HOME;
+  process.env.OPTCHAT_HOME = mkdtempSync(join(tmpdir(), 'optchat-home-'));
+  createProfile('draw');
+  const close = await serveWindows(profilePath('draw'), f.children, () => true, async text => { f.reports.push(text); });
+  const tui = new TuiMainScreen(new OffscreenTerminal());
+  const plainTheme = { fg: (_color: string, text: string) => text } as unknown as Theme;
+  let renderer: MessageRenderer | undefined, widget: (Component & { dispose?(): void }) | undefined;
+  const sent: { content: unknown; details?: { from?: string; turn?: unknown[] } }[] = [];
+  const pi = { registerMessageRenderer: (_type: string, r: MessageRenderer) => { renderer = r; }, sendMessage: (m: typeof sent[number]) => { sent.push(m); } } as unknown as ExtensionAPI;
+  registerConnectedRenderer(pi);
+  const ctx = { cwd: f.dir, shutdown() {}, ui: { setStatus() {}, notify() {}, setWorkingMessage() {}, setTitle() {},
+    setWidget: (_key: string, factory?: (tui: TuiMainScreen, theme: Theme) => Component) => { widget?.dispose?.(); widget = factory?.(tui, plainTheme); } } } as unknown as ExtensionContext;
+  // What the chat shows for a committed message, drawn through the registered renderer as Pi would.
+  const chat = (message: typeof sent[number]) => plain(new CustomMessageComponent({ role: 'custom', customType: 'optchat-connected', content: message.content as string,
+    display: true, details: message.details, timestamp: 1 }, renderer).render(100));
+  const live = () => widget ? plain(widget.render(100)) : '';
+  const turns = () => sent.filter(m => m.details?.turn);
+  // A turn restored before any window is live (after /reload) still draws as a tool box, not plain text.
+  const restored = { content: '', details: { from: 'agent', turn: [
+    { role: 'assistant', content: [{ type: 'toolCall', id: 'old', name: 'bash', arguments: { command: 'echo restored' } }], api: 'x', provider: 'x', model: 'x', usage: emptyUsage(), stopReason: 'toolUse', timestamp: 1 },
+    { role: 'toolResult', toolCallId: 'old', toolName: 'bash', content: [{ type: 'text', text: 'RESTORED_OUTPUT' }], isError: false, timestamp: 2 },
+  ] } };
+  assert.match(chat(restored), /\$ echo restored[\s\S]*RESTORED_OUTPUT/);
+  const window = await openConnectedWindow(pi, ctx, 'draw');
+  try {
+    await window.submit('Investigate this repository.');
+    const id = [...f.children.history.records.keys()][0]; assert.ok(id);
+    await until(() => f.children.history.records.get(id)?.state === 'waiting' && turns().length === 1);
+    assert.match(chat(turns()[0]), /Reply: Investigate this repository\./);
+    await until(() => !/Working|Waiting/.test(live()));
+
+    // A tool OptChat provides is drawn like a registered tool, on one line with its result, not as raw JSON.
+    await window.submit('ask main');
+    await until(() => turns().length >= 2);
+    const asked = chat(turns()[1]);
+    assert.match(asked, /tell_parent message="Need a decision from the main agent\."/);
+    assert.match(asked, /Message sent to the main agent/);
+    assert.doesNotMatch(asked, /^\s*"message":/m);
+    await until(() => f.children.history.records.get(id)?.state === 'waiting' && turns().length >= 3);
+
+    // Waiting on its own agent spins with a count; waiting on you does not spin at all.
+    await window.submit('spawn one');
+    await until(() => /Waiting for 1 agent/.test(live()));
+
+    // The live turn shows the streaming reply under the spinner; the finished bash call settles into the chat with its output.
+    await window.submit('descendant-evidence-task');
+    await until(() => /Working/.test(live()) && /Reply/.test(live()));
+    const bash = turns().map(chat).find(text => text.includes('printf'));
+    assert.ok(bash, 'the bash call is in the chat');
+    assert.match(bash, /DESCENDANT_TESTS_PASSED_123/, 'a reply and its tool results are one chat entry');
+  } finally {
+    widget?.dispose?.();
+    window.close(); await close(); await f.close();
+    rmSync(process.env.OPTCHAT_HOME!, { recursive: true, force: true });
+    if (oldHome === undefined) delete process.env.OPTCHAT_HOME; else process.env.OPTCHAT_HOME = oldHome;
+  }
 });
 
 test('a connected window titles its tab: waiting, working, done, and disconnected', async () => {

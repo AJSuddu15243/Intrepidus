@@ -5,19 +5,36 @@ import type { AgentMessage } from '@earendil-works/pi-agent-core';
 import { record } from './cache.ts';
 import { profileSocket } from './profiles.ts';
 import { textContent } from './transcript.ts';
+import { isActiveRun } from './runs.ts';
 
 type Action = 'start' | 'say' | 'tell-main' | 'complete';
 interface Request { kind: 'request'; id: number; action: Action; text?: string; cwd?: string }
 interface Reply { kind: 'reply'; id: number; error?: string }
-/** `from` marks the conversation itself (your messages and the agent's replies); other messages have no `from`. */
-export interface WindowEvent { kind: 'event'; name: 'started' | 'message' | 'status' | 'finished'; text: string; from?: 'user' | 'agent' }
+/** A tool the subagent is running right now, with its streamed output so far. */
+export interface LiveTool { id: string; name: string; args: unknown; output?: unknown; started: number }
+/** What the subagent is doing between finished messages: its streaming reply and running tools. */
+export interface LiveState { state: string; model: string; streaming?: AgentMessage; tools: LiveTool[]; agents?: number }
+/**
+ * `from` marks the conversation itself (your messages and the agent's replies); other messages have no `from`.
+ * `message` carries the agent's own messages (replies with tool calls, tool results) so the window can draw them with Pi's components.
+ */
+export interface WindowEvent {
+  kind: 'event'; name: 'started' | 'message' | 'status' | 'finished'; text: string; from?: 'user' | 'agent';
+  message?: AgentMessage; live?: LiveState;
+}
 type Frame = Request | Reply | WindowEvent;
 const errorText = (error: unknown) => error instanceof Error ? error.message : String(error);
+const isMessage = (value: unknown): value is AgentMessage => record(value) && (value.role === 'assistant' || value.role === 'toolResult') && Array.isArray(value.content);
+const isLive = (value: unknown): value is LiveState => record(value) && typeof value.state === 'string' && typeof value.model === 'string'
+  && (value.streaming === undefined || isMessage(value.streaming))
+  && Array.isArray(value.tools) && value.tools.every(t => record(t) && typeof t.id === 'string' && typeof t.name === 'string' && typeof t.started === 'number')
+  && (value.agents === undefined || typeof value.agents === 'number');
 function parse(value: unknown): Frame {
   if (!record(value)) throw new Error('Invalid window message');
   const name = value.name, action = value.action, from = value.from;
   if (value.kind === 'event' && (name === 'started' || name === 'message' || name === 'status' || name === 'finished') && typeof value.text === 'string')
-    return { kind: 'event', name, text: value.text, from: from === 'user' || from === 'agent' ? from : undefined };
+    return { kind: 'event', name, text: value.text, from: from === 'user' || from === 'agent' ? from : undefined,
+      message: isMessage(value.message) ? value.message : undefined, live: isLive(value.live) ? value.live : undefined };
   if (typeof value.id !== 'number' || !Number.isSafeInteger(value.id)) throw new Error('Invalid request ID');
   if (value.kind === 'reply' && (value.error === undefined || typeof value.error === 'string')) return { kind: 'reply', id: value.id, error: value.error };
   if (value.kind === 'request' && (action === 'start' || action === 'say' || action === 'tell-main' || action === 'complete')
@@ -25,6 +42,23 @@ function parse(value: unknown): Frame {
     return { kind: 'request', id: value.id, action, text: value.text, cwd: value.cwd };
   throw new Error('Invalid window message');
 }
+const SHORTENED = '\n[Display shortened; full text is saved in the transcript.]';
+const shorten = (text: string, limit: number) => text.length > limit ? `${text.slice(0, limit)}${SHORTENED}` : text;
+/** Long text parts are cut and images dropped: the window only draws them, the owner keeps the full transcript. */
+function clipContent(content: unknown): unknown {
+  if (!Array.isArray(content)) return content;
+  return content.map(part => !record(part) ? part : part.type === 'text' && typeof part.text === 'string' ? { ...part, text: shorten(part.text, 50_000) }
+    : part.type === 'image' ? { type: 'text', text: '[image]' } : part);
+}
+const clip = (message: AgentMessage) => ({ ...message, content: clipContent('content' in message ? message.content : []) }) as AgentMessage;
+const clipOutput = (output: unknown) => record(output) ? { ...output, content: clipContent(output.content) } : output;
+/**
+ * Huge tool arguments (a large file write) would choke the socket; the window then falls back to text.
+ * Partial tool output comes from any extension and may not serialize (a cycle, a BigInt); that falls back too
+ * instead of throwing inside the status timer, which would take the owner's Pi down with it.
+ */
+const fits = (value: unknown) => { try { return JSON.stringify(value).length < 1_000_000; } catch { return false; } };
+
 /** Local JSONL protocol, bounded before parsing; the socket is accessible only by its OS user. */
 function wire(socket: Socket, receive: (frame: Frame) => void) {
   let buffer = '';
@@ -94,13 +128,15 @@ export async function serveWindows(directory: string, children: Children, availa
       track(queue);
     });
     const drainMessages = (messages: AgentMessage[], task: string) => {
-      const displayable = messages.filter(message => message.role === 'user' || message.role === 'assistant');
+      const displayable = messages.filter(message => message.role === 'user' || message.role === 'assistant' || message.role === 'toolResult');
       while (cursor < displayable.length) {
         const message = displayable[cursor++];
-        let text = textContent(message.content);
+        let text = message.role === 'toolResult' ? '' : textContent(message.content);
         if (message.role === 'user' && firstUser) { text = task; firstUser = false; said.add(task.trim()); }
-        const from = message.role === 'assistant' ? 'agent' : said.has(text.trim()) ? 'user' : undefined;
-        if (text) send({ kind: 'event', name: 'message', from, text: `${text.slice(0, 200_000)}${text.length > 200_000 ? '\n[Display shortened; full text is saved in the transcript.]' : ''}` });
+        if (message.role === 'user') { if (text) send({ kind: 'event', name: 'message', from: said.has(text.trim()) ? 'user' : undefined, text: shorten(text, 200_000) }); continue; }
+        const clipped = clip(message);
+        if (fits(clipped)) send({ kind: 'event', name: 'message', from: message.role === 'assistant' ? 'agent' : undefined, text: shorten(text, 200_000), message: clipped });
+        else if (text) send({ kind: 'event', name: 'message', from: 'agent', text: shorten(text, 200_000) });
       }
     };
     const timer = setInterval(() => {
@@ -109,8 +145,14 @@ export async function serveWindows(directory: string, children: Children, availa
       if (!info) return;
       if (live) drainMessages(live.session.messages, info.task);
       const preview = live?.streaming && 'content' in live.streaming ? textContent(live.streaming.content).slice(-2000) : '';
-      const status = `${info.state === 'waiting' ? 'Awaiting user or child reports' : info.state} · ${info.model}\n${live ? [...live.tools.values()].map(t => t.name).join(', ') : ''}\n${preview}`;
-      if (status !== lastStatus) { lastStatus = status; send({ kind: 'event', name: 'status', text: status }); }
+      const text = `${info.state === 'waiting' ? 'Awaiting user or child reports' : info.state} · ${info.model}\n${live ? [...live.tools.values()].map(t => t.name).join(', ') : ''}\n${preview}`;
+      let state: LiveState = { state: info.state, model: info.model,
+        streaming: live?.streaming?.role === 'assistant' ? clip(live.streaming) : undefined,
+        tools: live ? [...live.tools].map(([id, t]) => ({ id, name: t.name, args: t.args, output: clipOutput(t.output), started: t.started })) : [],
+        agents: [...children.history.records.values()].filter(run => run.parentId === child && isActiveRun(run)).length };
+      if (!fits(state)) state = { ...state, streaming: undefined, tools: state.tools.map(t => ({ ...t, args: {}, output: undefined })) };
+      const status = JSON.stringify(state);
+      if (status !== lastStatus) { lastStatus = status; send({ kind: 'event', name: 'status', text, live: state }); }
       if (!live && info.handoff?.delivered) {
         try { drainMessages(children.messages(child), info.task); }
         catch (error) { send({ kind: 'event', name: 'message', text: `Could not read the final transcript: ${errorText(error)}` }); }

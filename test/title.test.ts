@@ -30,9 +30,11 @@ test('tab titles show the profile, whether the agent is working, and running sub
   assert.equal(windowTitle('personal', 'done'), '↳ personal · done');
   assert.equal(windowTitle('personal', 'disconnected'), '↳ personal · disconnected');
   // A status event never ends the conversation; the type keeps callers from expecting `done`/`disconnected`.
-  const live: StatusState = statusState('running · child\nbash\n');
+  const live: StatusState = statusState('running');
   assert.equal(live, 'working');
-  assert.equal(statusState('Awaiting user or child reports · child\n\n'), 'waiting');
+  assert.equal(statusState('stopping'), 'working');
+  assert.equal(statusState('waiting', 2), 'working', 'waiting on its own agents is still work');
+  assert.equal(statusState('waiting', 0), 'waiting', 'waiting with no agents means waiting for you');
 });
 
 test('the last title is re-applied after Pi overwrites it, and a stale ctx is ignored', () => {

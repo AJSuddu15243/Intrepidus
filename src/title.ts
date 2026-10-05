@@ -6,8 +6,9 @@ const agents = (count: number) => count > 0 ? ` · ${count} ${count === 1 ? 'age
 export const mainTitle = (profile: string, working: boolean, running: number) => `${working ? '● ' : ''}π ${profile}${agents(running)}`;
 export const windowTitle = (profile: string, state: WindowState) =>
   `${state === 'working' ? '● ' : ''}↳ ${profile}${state === 'done' || state === 'disconnected' ? ` · ${state}` : ''}`;
-/** Window status events start with the child's state; `waiting` is shown as "Awaiting user or child reports". */
-export const statusState = (status: string): StatusState => status.startsWith('running') ? 'working' : 'waiting';
+/** A connected window's agent is working while it runs or stops, or waits on agents of its own; waiting with none means waiting for you. */
+export const statusState = (state: string, agents = 0): StatusState =>
+  state === 'running' || state === 'stopping' || state === 'waiting' && agents > 0 ? 'working' : 'waiting';
 
 /**
  * Pi writes its own "π - <cwd>" title after binding a session (startup, reload, profile switch) and on
