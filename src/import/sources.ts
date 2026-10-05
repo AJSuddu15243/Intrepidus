@@ -1,7 +1,7 @@
 import { createReadStream } from 'node:fs';
 import { readdir, readFile, stat } from 'node:fs/promises';
 import { createInterface } from 'node:readline';
-import { basename, dirname, join, resolve } from 'node:path';
+import { basename, dirname, join, relative, resolve } from 'node:path';
 import { homedir } from 'node:os';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
@@ -80,18 +80,20 @@ export async function scanLocal(source: 'claude' | 'codex', roots?: string[], si
   for (const folder of folders) for (const file of await filesUnder(folder, n => n.endsWith('.jsonl') && !(source === 'claude' && n === 'journal.jsonl'), signal)) {
     signal?.throwIfAborted();
     // Import user conversations, not separate delegated runs (including Claude's older flat layout).
-    if (source === 'claude' && (file.split(/[\\/]/).includes('subagents') || basename(file).startsWith('agent-'))) continue;
+    if (source === 'claude' && (relative(folder, dirname(file)).split(/[\\/]/).includes('subagents') || basename(file).startsWith('agent-'))) continue;
     try {
       const info = await stat(file);
       let id = basename(file, '.jsonl'), project = dirname(file), date = info.mtime.toISOString(), title = '';
       let sidechain = false;
-      for await (const { value: v } of jsonLines(file, warnings, 60, signal)) {
+      for await (const { value: v, line } of jsonLines(file, warnings, source === 'claude' ? Infinity : 60, signal)) {
+        // Sidechain markers can appear late; picker metadata still comes from the first 60 lines.
+        if (source === 'claude' && v.isSidechain === true) { sidechain = true; break; }
+        if (line > 60) continue;
         if (source === 'codex' && v.type === 'session_meta' && record(v.payload)) {
           if (codexSubagent(v.payload)) { sidechain = true; break; }
           id = string(v.payload.id) ?? id; project = string(v.payload.cwd) ?? project; date = timestamp(v.payload.timestamp ?? v.timestamp, date);
         }
         if (source === 'claude') {
-          if (v.isSidechain === true) { sidechain = true; break; }
           id = string(v.sessionId) ?? id;
           project = string(v.cwd) ?? project;
           if (v.type === 'custom-title' || v.type === 'ai-title') title = string(v.customTitle ?? v.aiTitle) ?? title;
@@ -256,7 +258,9 @@ export async function readConversation(c: Conversation, signal?: AbortSignal): P
           if (m.type === 'message' && m.role === 'user') { finish(); add(id, 'user', text(m.content), date); }
           else if (m.type === 'message' && m.role === 'assistant') {
             pending = [];
-            if (!m.channel || m.channel === 'final') assistant([{ id, content: text(m.content) }], date, m.channel === 'final');
+            const channel = m.channel ?? m.phase;
+            const final = channel === 'final' || channel === 'final_answer';
+            if (!channel || final) assistant([{ id, content: text(m.content) }], date, final);
           } else if (['function_call', 'custom_tool_call', 'function_call_output', 'custom_tool_call_output', 'web_search_call', 'image_generation_call', 'local_shell_call', 'agent_message'].includes(String(m.type))) pending = [];
           else if (!['message', 'reasoning'].includes(String(m.type))) { pending = []; warnings.push(`${c.file}:${line}: unsupported response item ${String(m.type)} skipped`); }
         }

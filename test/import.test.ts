@@ -71,6 +71,24 @@ test('Codex imports user messages and final answers once, excluding commentary, 
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
+test('Codex phase markers exclude commentary and commit explicit final answers immediately', async () => {
+  const dir = temp(), file = join(dir, 'phases.jsonl');
+  const message = (id: string, phase: string, channel?: string | null) => ({ type: 'response_item', timestamp: date,
+    payload: { type: 'message', id, role: 'assistant', phase, channel, content: [{ type: 'output_text', text: id }] } });
+  const complete = { type: 'event_msg', payload: { type: 'task_complete' } };
+  lines(file, [
+    message('progress', 'commentary'), complete,
+    message('answer', 'final_answer', null),
+    { type: 'response_item', payload: { type: 'function_call', name: 'read', arguments: '{}' } },
+    message('more-progress', 'commentary', null), complete,
+  ]);
+  try {
+    const parsed = await readConversation(conversation('codex', file));
+    assert.deepEqual(parsed.entries.map(e => e.origin?.message), ['answer']);
+    assert.deepEqual(parsed.warnings, []);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
 test('legacy Claude replies survive tool loops while interrupted text and distinct repeated requests are handled correctly', async () => {
   const dir = temp(), file = join(dir, 'legacy.jsonl');
   const message = (uuid: string, role: string, content: unknown, stop_reason?: string) => ({ type: role, uuid, timestamp: date, message: { role, content, stop_reason } });
@@ -153,7 +171,8 @@ test('ChatGPT keeps user messages and final replies on each branch with stable i
 });
 
 test('Claude discovery keeps the parent conversation and skips modern, legacy, and sidechain child logs', async () => {
-  const dir = temp(), sub = join(dir, 'session', 'subagents'); mkdirSync(sub, { recursive: true });
+  const root = temp(), dir = join(root, 'subagents', '.claude', 'projects');
+  const sub = join(dir, 'session', 'subagents'); mkdirSync(sub, { recursive: true });
   const parent = join(dir, 'session.jsonl');
   const user = { type: 'user', sessionId: 'shared', cwd: '/project', timestamp: date, message: { role: 'user', content: 'Parent request' } };
   lines(parent, [user, { type: 'assistant', sessionId: 'shared', message: { role: 'assistant', content: 'Child reported useful findings.' } }]);
@@ -173,6 +192,30 @@ test('Claude discovery keeps the parent conversation and skips modern, legacy, a
     assert.match(parsed.entries[1].text, /Child reported useful findings/);
     assert.deepEqual(scan.warnings, []);
     await assert.rejects(scanLocal('claude', [dir], AbortSignal.abort()));
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('Claude discovery checks late sidechain markers without extending metadata extraction or Codex scanning', async () => {
+  const dir = temp(), parent = join(dir, 'parent.jsonl'), child = join(dir, 'renamed-child.jsonl');
+  const metadata = Array.from({ length: 60 }, () => ({ type: 'file-history-snapshot' }));
+  const user = { type: 'user', sessionId: 'parent', cwd: '/project', timestamp: date, message: { role: 'user', content: 'Parent request' } };
+  lines(parent, [user, ...metadata.slice(1), { type: 'custom-title', sessionId: 'later', cwd: '/later', customTitle: 'Later title' }]);
+  lines(child, [...metadata, { ...user, isSidechain: true }]);
+  try {
+    const scan = await scanLocal('claude', [dir]);
+    assert.deepEqual(scan.conversations.map(c => c.file), [parent]);
+    const { id, project, title, date: foundDate } = scan.conversations[0];
+    assert.deepEqual({ id, project, title, date: foundDate }, { id: 'parent', project: '/project', title: 'Parent request', date });
+    assert.deepEqual(scan.warnings, []);
+    assert.equal((await readConversation(conversation('claude', child))).entries.length, 0);
+
+    // Invalid JSON after line 60 would warn if Codex discovery read beyond its metadata budget.
+    writeFileSync(parent, [JSON.stringify({ type: 'session_meta', payload: { id: 'codex-parent', cwd: '/project', source: 'cli', timestamp: date } }),
+      ...metadata.slice(1).map(value => JSON.stringify(value)), 'not JSON'].join('\n') + '\n');
+    rmSync(child);
+    const codex = await scanLocal('codex', [dir]);
+    assert.deepEqual(codex.conversations.map(c => c.id), ['codex-parent']);
+    assert.deepEqual(codex.warnings, []);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
