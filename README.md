@@ -91,13 +91,13 @@ Set a different shortcut with `OPTCHAT_INSPECT_KEY=ctrl+shift+a pi`. If another 
 
 **Agents** lists runs as a tree with state, elapsed time, current tool, and last activity. Navigate with **Up/Down**, **Page Up/Down**, **Home/End**, and press **M** to pick the subagent model.
 
-**Enter** swaps the screen to that agent's conversation, drawn with Pi's own chat components, so it reads like the main chat: its task, replies, and collapsed tool calls, following live output. Typing and **Enter** send it guidance. **Escape** goes back to the main chat.
+**Enter** swaps the screen to that agent's conversation, drawn with Pi's own chat components, so it reads like the main chat: its task, replies, and collapsed tool calls, following live output. Typing and **Enter** send it guidance. Guidance from the main agent and reports from the agent's own agents show in labelled boxes, so only your own messages look typed. **Escape** goes back to the main chat.
 
 | Key | Action |
 | --- | --- |
-| **Escape** | Back to the main chat |
+| **Escape** or **Ctrl+C** | Clear a draft, else back to the main chat |
 | **Ctrl+X** twice | Stop this agent and the agents it started |
-| **Page Up/Down** | Scroll; back at the bottom it follows again |
+| **Page Up/Down**, mouse wheel | Scroll; back at the bottom it follows again. The wheel needs Pi's default fullscreen mode |
 | **Ctrl+O** | Expand tool output (Pi's own toggle) |
 
 Guidance shows as queued until delivered, or undelivered if the child stops first. Guidance you send is also saved in main memory. Reasoning is not shown. Transcripts stay browsable after restart, and browsing them makes no model calls.
