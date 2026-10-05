@@ -7,7 +7,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { createHash } from 'node:crypto';
 import { record } from '../cache.ts';
-import { bytes, cap, type Entry, type Kind, type Origin } from '../memory.ts';
+import { bytes, type Entry, type Kind, type Origin } from '../memory.ts';
 
 export type Source = Origin['source'];
 export type ImportedEntry = Omit<Entry, 'i' | 'size'>;
@@ -18,6 +18,8 @@ export interface Conversation {
 export interface Scan { conversations: Conversation[]; warnings: string[] }
 const exec = promisify(execFile);
 const string = (v: unknown) => typeof v === 'string' ? v : undefined;
+const codexSubagent = (metadata: Record<string, unknown>) => metadata.source === 'subagent'
+  || record(metadata.source) && 'subagent' in metadata.source;
 const missingSource = (error: unknown) => record(error) && (error.code === 'ENOENT' || error.code === 'ENOTDIR');
 const missingWarning = (file: string) => `${file}: source file is no longer available; conversation skipped. Rescan to retry if it returns.`;
 export function timestamp(value: unknown, fallback: string): string {
@@ -39,10 +41,9 @@ function text(value: unknown): string {
 const digest = (s: string) => createHash('sha256').update(s).digest('hex');
 function imported(c: Conversation, id: string, kind: Kind, content: string, date: string, identity = content): ImportedEntry | undefined {
   if (!content.trim()) return undefined;
-  const body = kind === 'echo' ? cap(content) : content;
   // Text provenance survives compression. Stable per-message receipts survive moved files and repeated exports.
   const origin: Origin = { source: c.source, conversation: c.id, message: id, title: c.title, project: c.project };
-  return { kind, date, origin, text: `[Historical ${c.source} · ${date} · conversation ${c.id} · ${c.title}]\n${body}`,
+  return { kind, date, origin, text: `[Historical ${c.source} · ${date} · conversation ${c.id} · ${c.title}]\n${content}`,
     receipt: `import:${digest(JSON.stringify([c.source, c.id, id, kind, identity]))}` };
 }
 async function* jsonLines(file: string, warnings: string[], limit = Infinity, signal?: AbortSignal) {
@@ -86,6 +87,7 @@ export async function scanLocal(source: 'claude' | 'codex', roots?: string[], si
       let sidechain = false;
       for await (const { value: v } of jsonLines(file, warnings, 60, signal)) {
         if (source === 'codex' && v.type === 'session_meta' && record(v.payload)) {
+          if (codexSubagent(v.payload)) { sidechain = true; break; }
           id = string(v.payload.id) ?? id; project = string(v.payload.cwd) ?? project; date = timestamp(v.payload.timestamp ?? v.timestamp, date);
         }
         if (source === 'claude') {
@@ -170,15 +172,31 @@ export async function readConversation(c: Conversation, signal?: AbortSignal): P
       selected.add(cursor); cursor = string(node.parent);
     }
     const dates = new Map<string, string>();
+    // For legacy exports without final/end_turn markers, exclude replies followed by
+    // more assistant/tool work before the next user message, on the same branch.
+    const intermediate = new Set<string>();
+    for (const [, node] of ordered) {
+      if (!record(node.message) || !record(node.message.author) || !['assistant', 'tool'].includes(String(node.message.author.role))) continue;
+      let parent = string(node.parent);
+      while (parent) {
+        const ancestor = mapping[parent]; if (!record(ancestor)) break;
+        if (record(ancestor.message) && record(ancestor.message.author) && ancestor.message.author.role === 'user') break;
+        if (intermediate.has(parent)) break;
+        intermediate.add(parent); parent = string(ancestor.parent);
+      }
+    }
     for (const [key, node] of ordered) {
       signal?.throwIfAborted();
       const m = node.message;
       const date = timestamp(record(m) ? m.create_time : undefined, dates.get(String(node.parent)) ?? c.date);
       dates.set(key, date);
-      if (!record(m) || !record(m.author) || ['system', 'developer'].includes(String(m.author.role))) continue;
-      if ((m.channel === 'analysis' && (!m.recipient || m.recipient === 'all')) || (record(m.content) && ['thoughts', 'reasoning', 'reasoning_recap'].includes(String(m.content.content_type)))) continue;
-      const role = m.author.role, kind = role === 'user' ? 'user' : role === 'tool' ? 'echo' : role === 'assistant' ? (m.recipient && m.recipient !== 'all' ? 'tool' : 'talk') : undefined;
-      if (!kind) continue;
+      if (!record(m) || !record(m.author) || !['user', 'assistant'].includes(String(m.author.role))) continue;
+      if (m.channel === 'analysis' || m.channel === 'commentary'
+        || m.recipient && m.recipient !== 'all'
+        || record(m.content) && ['thoughts', 'reasoning', 'reasoning_recap'].includes(String(m.content.content_type))) continue;
+      const kind = m.author.role === 'user' ? 'user' : 'talk';
+      if (kind === 'talk' && (m.status && m.status !== 'finished_successfully'
+        || m.end_turn === false || m.channel !== 'final' && m.end_turn !== true && intermediate.has(key))) continue;
       const content = text(m.content); if (!content) continue;
       const branch = hasSelectedBranch ? selected.has(key) ? 'selected branch at export' : 'alternate branch, not the selected outcome' : 'branch selection unavailable';
       add(string(m.id) ?? key, kind, `[message ${key}; parent ${String(node.parent ?? 'root')}; ${branch}${m.recipient ? `; recipient ${String(m.recipient)}` : ''}]\n${content}`, date, content);
@@ -188,36 +206,62 @@ export async function readConversation(c: Conversation, signal?: AbortSignal): P
       add('export:selected-branch', 'note', `Selected ChatGPT branch in the ${snapshot} export snapshot ends at message ${String(c.exported?.current_node)}. Other branches are alternatives.`, snapshot);
     }
   } else {
+    let pending: ImportedEntry[] = [];
+    const finish = () => { entries.push(...pending); pending = []; };
+    const assistant = (parts: { id: string; content: string }[], date: string, final: boolean) => {
+      pending = parts.flatMap(part => {
+        const entry = imported(c, part.id, 'talk', part.content, date);
+        return entry ? [entry] : [];
+      });
+      if (final) finish();
+    };
     try {
       for await (const { value: v, line } of jsonLines(c.file, warnings, Infinity, signal)) {
         const date = timestamp(v.timestamp, c.date);
+        // Context replay and compaction scaffolding are not new user requests.
+        if (c.source === 'claude' && v.type === 'system' && v.subtype === 'compact_boundary') { pending = []; continue; }
+        if (c.source === 'claude' && (v.isMeta === true || v.isCompactSummary === true)) continue;
+        if (c.source === 'claude' && v.isSidechain === true) return { entries: [], warnings };
         if (c.source === 'claude' && ['user', 'assistant'].includes(String(v.type)) && record(v.message)) {
           const m = v.message, id = string(v.uuid) ?? `line:${line}`;
-          if (typeof m.content === 'string') add(id, m.role === 'user' ? 'user' : 'talk', m.content, date);
-          else if (Array.isArray(m.content)) for (const [index, b] of m.content.entries()) {
-            if (!record(b)) continue;
-            if (b.type === 'tool_use' || b.type === 'server_tool_use') add(`${id}:${index}`, 'tool', `${String(b.name)} ${JSON.stringify(b.input)} [call ${String(b.id)}]`, date);
-            else if (b.type === 'tool_result') add(`${id}:${index}`, 'echo', `[call ${String(b.tool_use_id)}${b.is_error ? '; error' : ''}] ${text(b.content)}`, date);
-            else {
-              const content = text(b);
-              if (content) add(`${id}:${index}`, m.role === 'user' ? 'user' : 'talk', content, date);
-              else if (!['thinking', 'redacted_thinking', 'reasoning', 'encrypted_content', 'text'].includes(String(b.type)))
-                warnings.push(`${c.file}:${line}: unsupported Claude content block ${String(b.type)} skipped`);
+          if (m.role === 'user' && typeof m.content === 'string' && /^\[Request interrupted by user(?: for tool use)?\]$/.test(m.content)) { pending = []; continue; }
+          const blocks = Array.isArray(m.content) ? m.content : [];
+          const toolActivity = blocks.some(b => record(b) && (['tool_use', 'server_tool_use', 'tool_result'].includes(String(b.type)) || String(b.type).endsWith('_tool_result')));
+          if (toolActivity) pending = [];
+          const parts = typeof m.content === 'string' ? [{ id, content: m.content }] : blocks.flatMap((b, index) => {
+            if (!record(b)) return [];
+            if (['text', 'image', 'image_url', 'document'].includes(String(b.type))) {
+              const content = b.type === 'document' ? '[document attachment; binary content is not imported]' : text(b);
+              return content ? [{ id: `${id}:${index}`, content }] : [];
             }
+            if (!['tool_use', 'server_tool_use', 'tool_result', 'thinking', 'redacted_thinking', 'reasoning', 'encrypted_content'].includes(String(b.type)) && !String(b.type).endsWith('_tool_result'))
+              warnings.push(`${c.file}:${line}: unsupported Claude content block ${String(b.type)} skipped`);
+            return [];
+          });
+          if (m.role === 'user' && parts.length) { finish(); for (const part of parts) add(part.id, 'user', part.content, date); }
+          else if (m.role === 'assistant') {
+            const final = m.stop_reason === 'end_turn' || m.stop_reason === 'stop_sequence';
+            if (toolActivity || v.isApiErrorMessage === true || m.stop_reason && !final) pending = [];
+            else if (parts.length) assistant(parts, date, final);
+            else if (!final) pending = [];
           }
+        }
+        if (c.source === 'codex' && v.type === 'session_meta' && record(v.payload) && codexSubagent(v.payload)) return { entries: [], warnings };
+        if (c.source === 'codex' && v.type === 'event_msg' && record(v.payload)) {
+          if (v.payload.type === 'task_complete') finish();
+          if (['turn_aborted', 'task_started', 'task_failed'].includes(String(v.payload.type))) pending = [];
         }
         if (c.source === 'codex' && v.type === 'response_item' && record(v.payload)) {
           const m = v.payload, id = string(m.id) ?? string(m.call_id) ?? `line:${line}`;
-          if (m.type === 'message' && ['user', 'assistant'].includes(String(m.role)) && m.channel !== 'analysis')
-            add(id, m.role === 'user' ? 'user' : 'talk', text(m.content), date);
-          else if (m.type === 'function_call' || m.type === 'custom_tool_call')
-            add(`${id}:call`, 'tool', `${String(m.name)} ${String(m.arguments ?? m.input ?? '')} [call ${String(m.call_id)}]`, date);
-          else if (m.type === 'function_call_output' || m.type === 'custom_tool_call_output')
-            add(`${id}:output`, 'echo', `[call ${String(m.call_id)}] ${text(m.output)}`, date);
-          else if (m.type === 'agent_message') add(id, 'note', `[agent ${String(m.author)} to ${String(m.recipient)}] ${text(m.content)}`, date);
-          else if (!['message', 'reasoning'].includes(String(m.type))) warnings.push(`${c.file}:${line}: unsupported response item ${String(m.type)} skipped`);
+          if (m.type === 'message' && m.role === 'user') { finish(); add(id, 'user', text(m.content), date); }
+          else if (m.type === 'message' && m.role === 'assistant') {
+            pending = [];
+            if (!m.channel || m.channel === 'final') assistant([{ id, content: text(m.content) }], date, m.channel === 'final');
+          } else if (['function_call', 'custom_tool_call', 'function_call_output', 'custom_tool_call_output', 'web_search_call', 'image_generation_call', 'local_shell_call', 'agent_message'].includes(String(m.type))) pending = [];
+          else if (!['message', 'reasoning'].includes(String(m.type))) { pending = []; warnings.push(`${c.file}:${line}: unsupported response item ${String(m.type)} skipped`); }
         }
       }
+      finish(); // Older exports may omit explicit final markers; retain only the last text reply.
     } catch (error) {
       signal?.throwIfAborted();
       if (!missingSource(error)) throw error;
