@@ -69,6 +69,7 @@ Ask in plain words, for example: "Spawn an agent to investigate this repository 
 
 - Children get the profile's memory view (frozen at launch), its instructions, read-only `zoom`/`date`, and normal coding tools plus your installed extensions.
 - Each child reports back on its own when it finishes. The parent stays alive to receive reports; it never polls.
+- In the main chat, subagent messages and reports appear in a dark grey box labelled `↳ subagent <id> · still running` or `· report`, so they never look like something you typed. The model still receives them as ordinary user messages.
 - The parent can send a running child guidance with `tell`, and the child can message its parent mid-run with `tell_parent` (a question, an early finding). It reaches the parent like a report, marked "still running": between tool calls if the parent is busy, or waking it if it's waiting.
 - Delegation goes up to three levels below the main agent (child, grandchild, great-grandchild).
 - At most 8 agents can be active per profile, including parents waiting on descendants. Going over a limit returns an error; there is no queue.

@@ -11,7 +11,8 @@ import { createCompressor } from './compactor.ts';
 import { atomicWrite, createProfile, instructions, lastProfile, listProfiles, loadConfig, lockProfile, profilePath, rememberProfile, saveConfig, ProfileBusyError, type ProfileConfig } from './profiles.ts';
 import { MASTER, VIEW_DOC } from './prompts.ts';
 import { cachePayload, record } from './cache.ts';
-import { boundedMessage, buildContext, logMessage, previousExchange, RUN_BOUNDARY, textContent } from './transcript.ts';
+import { asUser, boundedMessage, buildContext, logMessage, previousExchange, REPORT_TYPE, RUN_BOUNDARY, textContent } from './transcript.ts';
+import { registerReportRenderer } from './report-message.ts';
 import { memoryTools, result } from './tools.ts';
 import { Children } from './agents.ts';
 import { exportBrowser } from './browser.ts';
@@ -76,10 +77,16 @@ export default function optchat(pi: ExtensionAPI) {
       }
     }
   };
+  // Shown as a dark background box, not as the user's own message. Before this profile has run once there is no
+  // built system prompt to reuse, so that rare case still goes through Pi's normal prompt path as a user message.
+  const sendReport = (text: string) => {
+    if (prompt) pi.sendMessage({ customType: REPORT_TYPE, content: text, display: true }, { triggerTurn: true, deliverAs: 'steer' });
+    else pi.sendUserMessage(text, { deliverAs: 'steer', expandPromptTemplates: false });
+  };
   const deliverReport = async (text: string, once = false) => {
     if (once && (active?.memory.root.some(e => e.receipt === reportReceipt(text)) || reports.includes(text))) return;
     reports.push(text); saveReports();
-    if (!stopping) pi.sendUserMessage(text, { deliverAs: 'steer', expandPromptTemplates: false });
+    if (!stopping) sendReport(text);
   };
   const stop = async () => {
     remote?.close(); remote = undefined;
@@ -95,7 +102,7 @@ export default function optchat(pi: ExtensionAPI) {
       await checkpoint(old.dir);
     } finally {
       await old.memory.close(); await old.unlock(); active = undefined;
-      run = []; previous = []; logged = 0; view = undefined; runStarted = false; receipts.clear();
+      run = []; previous = []; logged = 0; view = undefined; runStarted = false; receipts.clear(); prompt = '';
     }
   };
   const chooseProfile = async (ctx: ExtensionContext): Promise<string | undefined> => {
@@ -143,7 +150,7 @@ export default function optchat(pi: ExtensionAPI) {
       ctx.ui.notify(`OptChat · ${name} · ${memory.root.length} messages\nCompactor: ${config.compactor.provider}/${config.compactor.model} (${config.compactor.thinking})`, 'info');
       const queuedReports = [...reports];
       if (!pendingImport(dir)) recovery = children.recoverHandoffs().catch(error => ctx.ui.notify(`Handoff recovery: ${errorText(error)}`, 'error'));
-      setImmediate(() => { if (active?.memory === memory && !pendingImport(dir)) for (const text of queuedReports) pi.sendUserMessage(text, { deliverAs: 'steer', expandPromptTemplates: false }); });
+      setImmediate(() => { if (active?.memory === memory && !pendingImport(dir)) for (const text of queuedReports) sendReport(text); });
     } catch (error) {
       await closeWindows?.(); closeWindows = undefined;
       if (active && active.memory === openingMemory) {
@@ -195,10 +202,15 @@ export default function optchat(pi: ExtensionAPI) {
     }
     return { action: 'continue' };
   });
-  pi.on('before_agent_start', (event, ctx) => {
+  const startRun = (ctx: ExtensionContext) => {
     flush(); run = []; logged = 0; view = undefined; runStarted = true;
     previous = previousExchange(ctx.sessionManager.getBranch());
     pi.appendEntry(RUN_BOUNDARY, { state: 'start' });
+  };
+  // A report sent while Pi is idle starts its run without before_agent_start; it reuses the last built prompt.
+  pi.on('agent_start', (_event, ctx) => { if (active && !runStarted) startRun(ctx); });
+  pi.on('before_agent_start', (event, ctx) => {
+    startRun(ctx);
     const a = required();
     // Pi's own prompt sections (AGENTS.md files, skills, cwd) stay; the profile's instructions go last.
     event.systemPromptOptions.customPrompt = `${MASTER}\n\n${VIEW_DOC}\n\nFor conversational continuity, the memory view may be followed by the immediately preceding completed exchange (its user requests and final answer, in full text), then the new input. Use that exact wording to understand follow-ups; older exchanges and previous tool output remain accessible through memory and zoom.`;
@@ -207,7 +219,8 @@ export default function optchat(pi: ExtensionAPI) {
   });
   pi.on('message_end', (event, ctx) => {
     if (!active || !runStarted) return;
-    const message = boundedMessage(event.message);
+    const bounded = boundedMessage(event.message);
+    const message = asUser(bounded);
     if (message.role === 'user') {
       try {
         const text = textContent(message.content);
@@ -223,7 +236,7 @@ export default function optchat(pi: ExtensionAPI) {
     if (view !== undefined) {
       try { flush(); } catch (error) { ctx.abort(); fault = errorText(error); ctx.ui.notify(fault, 'error'); }
     }
-    if (message !== event.message) return { message };
+    if (bounded !== event.message) return { message: bounded };
   });
   pi.on('context_with_system', async (event, ctx) => {
     try {
@@ -268,6 +281,7 @@ export default function optchat(pi: ExtensionAPI) {
     }
   });
   registerConnectedRenderer(pi);
+  registerReportRenderer(pi);
   for (const tool of memoryTools(() => required().memory)) pi.registerTool(tool);
   pi.registerTool({ name: 'spawn', label: 'Spawn background agents',
     description: 'Start background subagents, returning IDs immediately. Use only when the user asks. Each receives the current memory view and read-only zoom/date. Children may delegate two more levels; the whole profile allows 8 active agents. Completion reports arrive automatically; never poll or sleep waiting for them.',
