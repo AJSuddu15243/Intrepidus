@@ -48,14 +48,14 @@ test('a busy profile offers to connect or pick another profile, and picking anot
     }
     unlock = await lockProfile(profilePath('busy'), 'busy · PID 1 · elsewhere');
 
-    // New session: pick `busy`, it's taken, choose "Pick another profile", then pick `other`.
+    // New session: pick `busy`, it's taken, choose "Back", then pick `other`.
     const asked: { title: string, options: string[] }[] = [];
-    const picks = ['busy', 'Pick another profile', 'other'];
+    const picks = ['busy', 'Back', 'other'];
     const fresh = await start(dir, { select: async (title, options) => { asked.push({ title, options }); return picks.shift(); } });
     sessions.push(fresh.session);
     assert.deepEqual(asked.map(a => a.title.split('\n')[0]), ['OptChat profile', 'busy is open in another window', 'OptChat profile']);
     assert.match(asked[1].title, /busy · PID 1 · elsewhere/);
-    assert.deepEqual(asked[1].options, ['Start a connected subagent conversation here', 'Pick another profile']);
+    assert.deepEqual(asked[1].options, ['Start a connected subagent conversation here', 'Back']);
     assert.equal(fresh.titles[0], 'π other');
     assert.deepEqual(fresh.errors, []);
     const bound = fresh.manager.getEntries().filter(e => e.type === 'custom' && e.customType === 'optchat.profile');

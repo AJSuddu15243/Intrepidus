@@ -114,7 +114,7 @@ export default function optchat(pi: ExtensionAPI) {
       untitle?.(); untitle = undefined; title.clear(); working = false;
     }
   };
-  const CONNECT = 'Start a connected subagent conversation here', PICK_ANOTHER = 'Pick another profile';
+  const CONNECT = 'Start a connected subagent conversation here', BACK = 'Back';
   const chooseProfile = async (ctx: ExtensionContext): Promise<string | undefined> => {
     if (!ctx.hasUI) return undefined;
     const names = listProfiles(), last = lastProfile();
@@ -188,9 +188,9 @@ export default function optchat(pi: ExtensionAPI) {
         catch (error) {
           if (!(error instanceof ProfileBusyError) || ctx.mode !== 'tui') throw error;
           // A resumed session already belongs to this profile, so another profile needs a new session (/optchat profile).
-          const choice = await ctx.ui.select(`${name} is open in another window\n${error.owner}`, boundName ? [CONNECT] : [CONNECT, PICK_ANOTHER]);
+          const choice = await ctx.ui.select(`${name} is open in another window\n${error.owner}`, boundName ? [CONNECT] : [CONNECT, BACK]);
           if (choice === CONNECT) { remote = await openConnectedWindow(pi, ctx, name, text => title.show(t => ctx.ui.setTitle(t), text)); fault = undefined; break; }
-          if (choice !== PICK_ANOTHER) throw error;
+          if (choice !== BACK) throw error;
           name = await chooseProfile(ctx);
         }
       }

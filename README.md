@@ -137,7 +137,7 @@ See OpenAI's guides on [exporting ChatGPT data](https://help.openai.com/en/artic
 
 ## Connected windows
 
-Each profile is locked to one Pi process. If you open the same profile in a second terminal, Pi offers to connect it to the original window as a subagent, or to pick another profile.
+Each profile is locked to one Pi process. If you open the same profile in a second terminal, Pi offers to connect it to the original window as a subagent, or to go back to the profile picker.
 
 - Your first message starts a subagent in the second window's working directory. Later messages continue the same conversation.
 - The window looks like a normal Pi chat: replies, tool calls with their output and running time, the working spinner, and reports from the subagent's own agents in the dark box. Ctrl+O expands tool output.
