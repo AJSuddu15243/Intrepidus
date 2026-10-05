@@ -174,6 +174,7 @@ To delete a profile, delete its folder. Your original Pi sessions are kept in Pi
 ## Good to know
 
 - **Profiles separate memory and instructions only.** Agents keep full filesystem access and share provider credentials.
+- **Tab title**: the terminal tab shows the profile and what it is doing: `π personal` while waiting for you, `● π personal` while the agent works, plus `· 2 agents` while subagents run. A connected window shows `↳ personal`, `● ↳ personal`, then `↳ personal · done` or `↳ personal · disconnected`. OptChat replaces Pi's default title and puts its own back when Pi resets it (new session, reload, rename).
 - **Use worktrees** when parallel agents edit the same repository; they share the filesystem.
 - **Instructions**: the main agent and subagents get Pi's usual global and repository `AGENTS.md` files and your skills, followed by the profile's `AGENTS.md`, which comes last and wins. OptChat replaces only Pi's opening prompt. Prompt templates work in the main session only.
 - **Images** are available during the current run but stored in memory as text placeholders.

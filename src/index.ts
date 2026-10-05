@@ -28,6 +28,7 @@ import { inspectorShortcut, mountNavigation } from './navigation.ts';
 import { serveWindows } from './window-bridge.ts';
 import { openConnectedWindow, registerConnectedRenderer } from './connected-window.ts';
 import { createHandoffSummarizer } from './handoff.ts';
+import { mainTitle, TabTitle } from './title.ts';
 
 const binding = 'optchat.profile';
 interface Active { name: string; dir: string; config: ProfileConfig; memory: Memory; inbox: Inbox; children: Children; usage: UsageLedger; unlock: () => Promise<void> }
@@ -54,6 +55,13 @@ export default function optchat(pi: ExtensionAPI) {
   let unmountNavigation: (() => void) | undefined;
   let inspectorController: AbortController | undefined;
   const shortcut = inspectorShortcut();
+  const title = new TabTitle();
+  let working = false;
+  let untitle: (() => void) | undefined;
+  const showTitle = (ctx: ExtensionContext) => {
+    const a = active;
+    if (a) title.show(text => ctx.ui.setTitle(text), mainTitle(a.name, working, a.children.ids.length));
+  };
   const reportReceipt = (text: string) => 'report:' + createHash('sha256').update(text).digest('hex');
   const errorText = (error: unknown) => error instanceof Error ? error.message : String(error);
   pi.registerFlag('optchat-profile', { description: 'OptChat profile (required for noninteractive sessions without a saved binding)', type: 'string' });
@@ -103,6 +111,7 @@ export default function optchat(pi: ExtensionAPI) {
     } finally {
       await old.memory.close(); await old.unlock(); active = undefined;
       run = []; previous = []; logged = 0; view = undefined; runStarted = false; receipts.clear(); prompt = '';
+      untitle?.(); untitle = undefined; title.clear(); working = false;
     }
   };
   const chooseProfile = async (ctx: ExtensionContext): Promise<string | undefined> => {
@@ -146,6 +155,7 @@ export default function optchat(pi: ExtensionAPI) {
       active = { name, dir, config, memory, inbox, children, usage, unlock }; fault = undefined;
       if (ctx.mode === 'tui') unmountNavigation = mountNavigation(ctx, children, shortcut, page => { void inspect(ctx, page); });
       closeWindows = await serveWindows(dir, children, () => !stopping && !importing && !pendingImport(dir), deliverReport);
+      untitle = children.subscribe(() => showTitle(ctx)); showTitle(ctx);
       status(ctx);
       ctx.ui.notify(`OptChat · ${name} · ${memory.root.length} messages\nCompactor: ${config.compactor.provider}/${config.compactor.model} (${config.compactor.thinking})`, 'info');
       const queuedReports = [...reports];
@@ -153,6 +163,7 @@ export default function optchat(pi: ExtensionAPI) {
       setImmediate(() => { if (active?.memory === memory && !pendingImport(dir)) for (const text of queuedReports) sendReport(text); });
     } catch (error) {
       await closeWindows?.(); closeWindows = undefined;
+      untitle?.(); untitle = undefined; title.clear();
       if (active && active.memory === openingMemory) {
         unmountNavigation?.(); unmountNavigation = undefined;
         await active.children.close(); active = undefined;
@@ -175,14 +186,17 @@ export default function optchat(pi: ExtensionAPI) {
       catch (error) {
         if (!(error instanceof ProfileBusyError) || ctx.mode !== 'tui') throw error;
         if (!await ctx.ui.confirm('Profile open in another window', `${error.owner}\nStart a connected subagent conversation here?`)) throw error;
-        remote = await openConnectedWindow(pi, ctx, name); fault = undefined;
+        remote = await openConnectedWindow(pi, ctx, name, text => title.show(t => ctx.ui.setTitle(t), text)); fault = undefined;
       }
       if (!boundName) pi.appendEntry(binding, { name });
     } catch (error) {
       if (active) await stop().catch(() => {});
       fault = errorText(error); ctx.ui.notify(fault, 'error');
     }
+    // Pi sets its own title once every session_start handler has finished, so put ours back afterwards.
+    for (const ms of [0, 250, 1000]) setTimeout(() => title.reapply(), ms).unref();
   });
+  pi.on('session_info_changed', () => title.reapply()); // Pi retitles the tab on session renames, just before this.
   pi.on('session_shutdown', stop);
   pi.on('session_before_switch', () => remote || importing || active?.children.active ? { cancel: true } : undefined);
   pi.on('session_before_fork', () => remote || importing || active?.children.active ? { cancel: true } : undefined);
@@ -208,7 +222,10 @@ export default function optchat(pi: ExtensionAPI) {
     pi.appendEntry(RUN_BOUNDARY, { state: 'start' });
   };
   // A report sent while Pi is idle starts its run without before_agent_start; it reuses the last built prompt.
-  pi.on('agent_start', (_event, ctx) => { if (active && !runStarted) startRun(ctx); });
+  pi.on('agent_start', (_event, ctx) => {
+    working = true; showTitle(ctx);
+    if (active && !runStarted) startRun(ctx);
+  });
   pi.on('before_agent_start', (event, ctx) => {
     startRun(ctx);
     const a = required();
@@ -274,6 +291,7 @@ export default function optchat(pi: ExtensionAPI) {
     try { flush(); } catch (error) { fault = errorText(error); ctx.ui.notify(fault, 'error'); }
     if (runStarted) pi.appendEntry(RUN_BOUNDARY, { state: 'end' });
     runStarted = false; status(ctx);
+    working = false; showTitle(ctx);
     if (active) {
       const dir = active.dir;
       checkpoints = checkpoints.then(() => checkpoint(dir)).catch(error => ctx.ui.notify(`Local checkpoint failed: ${errorText(error)}`, 'error'));
