@@ -115,16 +115,20 @@ export class Children {
         if (cancelled()) throw new Error('Parent or profile is stopping.');
         const id = randomUUID().slice(0, 8), directory = task.cwd ?? cwd;
         const delegation = depth < 3 ? 'You may delegate parts of your assigned task with spawn when useful. Child reports arrive automatically after your current run ends; the harness keeps you alive to receive them. Never poll, sleep, or wait in a tool for children. Finish your current work and return; you will be prompted with their results. The profile allows 8 active agents total.' : 'You are at the maximum delegation depth. Complete your task with your own tools.';
-        const prompt = `${SUBAGENT}\n\n${VIEW_DOC}\n\n${this.instructions()}\n\n${delegation}\n\n${connected ? 'You are speaking directly with the user in a connected window. Continue this conversation across requests. Use tell_main for questions or findings the main agent needs now. A handoff will be generated when the user completes or disconnects the window.' : ''}\n\nWorking directory: ${directory}`;
+        const instructions = [this.instructions(), delegation, connected ? 'You are speaking directly with the user in a connected window. Continue this conversation across requests. Use tell_main for questions or findings the main agent needs now. A handoff will be generated when the user completes or disconnects the window.' : ''].filter(Boolean).join('\n\n');
         // The user's settings list their installed packages; a copy in memory keeps the child from writing them back.
         const settingsManager = SettingsManager.inMemory({ ...SettingsManager.create(directory, getAgentDir()).getSettings(), compaction: { enabled: false }, cacheWarming: 'off' });
         const loader = new DefaultResourceLoader({ cwd: directory, agentDir: getAgentDir(), settingsManager,
-          noContextFiles: true, noSkills: true, noPromptTemplates: true, systemPrompt: prompt,
+          noPromptTemplates: true,
           extensionsOverride: base => ({ ...base, extensions: base.extensions.filter(e => !isOptchat(e.resolvedPath)) }),
           extensionFactories: [pi => {
             const provider = this.registry.getRegisteredProviderConfig(selected.provider);
             if (provider) pi.registerProvider(selected.provider, provider);
-            pi.on('before_agent_start', () => ({ systemPrompt: prompt }));
+            // Same prompt as the main agent (AGENTS.md files, skills, cwd); only the OptChat preamble differs.
+            pi.on('before_agent_start', event => {
+              event.systemPromptOptions.customPrompt = `${SUBAGENT}\n\n${VIEW_DOC}`;
+              event.systemPromptOptions.sections.instructions = instructions;
+            });
             pi.on('before_provider_request', (event, ctx) => ctx.model?.api === 'anthropic-messages' ? cachePayload(event.payload) : event.payload);
           }],
         });

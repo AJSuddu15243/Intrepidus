@@ -171,7 +171,7 @@ To delete a profile, delete its folder. Your original Pi sessions are kept in Pi
 
 - **Profiles separate memory and instructions only.** Agents keep full filesystem access and share provider credentials.
 - **Use worktrees** when parallel agents edit the same repository; they share the filesystem.
-- **Instructions**: only the profile's `AGENTS.md` is injected. Repository and global Pi `AGENTS.md` files are not; ask the agent to read them when needed. Skills and prompt templates still work in the main session.
+- **Instructions**: the main agent and subagents get Pi's usual global and repository `AGENTS.md` files and your skills, followed by the profile's `AGENTS.md`, which comes last and wins. OptChat replaces only Pi's opening prompt. Prompt templates work in the main session only.
 - **Images** are available during the current run but stored in memory as text placeholders.
 - **Pi's auto-compaction is off.** A single very long run can still hit the model's context limit; stop it and continue in a new turn.
 - **Restarts**: unsent inputs are recovered into memory, and pending subagent reports are delivered. Interrupted subagents are not restarted.
