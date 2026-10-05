@@ -115,7 +115,8 @@ export class Children {
         if (cancelled()) throw new Error('Parent or profile is stopping.');
         const id = randomUUID().slice(0, 8), directory = task.cwd ?? cwd;
         const delegation = depth < 3 ? 'You may delegate parts of your assigned task with spawn when useful. Child reports arrive automatically after your current run ends; the harness keeps you alive to receive them. Never poll, sleep, or wait in a tool for children. Finish your current work and return; you will be prompted with their results. The profile allows 8 active agents total.' : 'You are at the maximum delegation depth. Complete your task with your own tools.';
-        const instructions = [this.instructions(), delegation, connected ? 'You are speaking directly with the user in a connected window. Continue this conversation across requests. Use tell_main for questions or findings the main agent needs now. A handoff will be generated when the user completes or disconnects the window.' : ''].filter(Boolean).join('\n\n');
+        const instructions = [this.instructions(), delegation, connected ? 'You are speaking directly with the user in a connected window. Continue this conversation across requests. Use tell_parent for questions or findings the main agent needs now. A handoff will be generated when the user completes or disconnects the window.'
+          : 'Use tell_parent only when your parent needs something now (a blocking question, an important early finding, or when asked to). Your final answer is delivered automatically; do not repeat it with tell_parent.'].filter(Boolean).join('\n\n');
         // The user's settings list their installed packages; a copy in memory keeps the child from writing them back.
         const settingsManager = SettingsManager.inMemory({ ...SettingsManager.create(directory, getAgentDir()).getSettings(), compaction: { enabled: false }, cacheWarming: 'off' });
         const loader = new DefaultResourceLoader({ cwd: directory, agentDir: getAgentDir(), settingsManager,
@@ -135,12 +136,7 @@ export class Children {
         await loader.reload();
         const { session } = await (this.options.createSession ?? createAgentSession)({ cwd: directory, resourceLoader: loader, settingsManager,
           model, thinkingLevel: selected.thinking, sessionManager: SessionManager.create(directory, join(this.profileDirectory, 'runs')),
-          customTools: [...memoryTools(() => this.memory), ...(depth < 3 ? this.delegationTools(id, directory) : []), ...(connected ? [{
-            name: 'tell_main', label: 'Message main agent', description: 'Send the main agent a question or important finding. Its reply can arrive as guidance; continue useful work instead of polling.',
-            parameters: Type.Object({ message: Type.String() }), execute: async (_id: string, args: { message: string }) => {
-              await this.report(`[${id}] Connected agent message: ${args.message}`); return result('Message sent to the main agent.');
-            },
-          }] : [])],
+          customTools: [...memoryTools(() => this.memory), ...(depth < 3 ? this.delegationTools(id, directory) : []), this.parentTool(id, parentId, connected)],
           excludeTools: depth < 3 ? [] : ['spawn', 'tell'],
         });
         await session.bindExtensions({});
@@ -184,6 +180,24 @@ export class Children {
         return result(await this.tell(args.id, args.message));
       },
     }];
+  }
+  /** Lets a child message its parent mid-run, the way tell lets the parent guide it. */
+  private parentTool(id: string, parentId: string | undefined, connected: boolean) {
+    return { name: 'tell_parent', label: parentId ? 'Message parent agent' : 'Message main agent',
+      description: `Send ${parentId ? 'your parent agent' : 'the main agent'} a question or important finding while you keep working. Its reply can arrive as guidance; continue useful work instead of polling. Your final answer is delivered automatically.`,
+      parameters: Type.Object({ message: Type.String() }), execute: async (_id: string, args: { message: string }) => {
+        const message = args.message.trim();
+        if (!message) throw new Error('Message is empty.');
+        const text = `[${id}] ${connected ? 'Connected agent message' : 'Message from subagent (still running)'}: ${message}`;
+        if (!parentId) { await this.report(text); return result('Message sent to the main agent.'); }
+        const parent = this.running.get(parentId);
+        if (!parent || !['running', 'waiting'].includes(parent.info.state)) throw new Error('Your parent is no longer running.');
+        if (parent.info.state === 'waiting') { parent.pendingReports.push(text); parent.wake?.(); }
+        else await parent.session.steer(text);
+        this.changed();
+        return result(`Message sent to parent ${parentId}.`);
+      },
+    };
   }
   private directChildren(id: string) { return [...this.running.values()].filter(c => c.info.parentId === id); }
   private async execute(live: LiveRun, view: string) {

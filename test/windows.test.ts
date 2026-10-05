@@ -52,7 +52,7 @@ async function fixture(contextWindow = 1_000_000, maxTokens = 64_000) {
       }
       if (summary && control.failSummary) { message.stopReason = 'error'; message.errorMessage = 'Synthetic summarizer unavailable'; }
       if (text === 'ask main') {
-        message.content = [{ type: 'toolCall', id: 'tell-main', name: 'tell_main', arguments: { message: 'Need a decision from the main agent.' } }];
+        message.content = [{ type: 'toolCall', id: 'tell-main', name: 'tell_parent', arguments: { message: 'Need a decision from the main agent.' } }];
         message.stopReason = 'toolUse';
       }
       void (async () => {
