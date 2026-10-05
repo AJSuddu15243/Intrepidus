@@ -1,6 +1,7 @@
 import { chmodSync, existsSync, unlinkSync } from 'node:fs';
 import { createConnection, createServer, type Socket } from 'node:net';
 import type { Children } from './agents.ts';
+import type { AgentMessage } from '@earendil-works/pi-agent-core';
 import { record } from './cache.ts';
 import { profileSocket } from './profiles.ts';
 import { textContent } from './transcript.ts';
@@ -74,6 +75,8 @@ export async function serveWindows(directory: string, children: Children, availa
           } else {
             if (!child) throw new Error('Send your first request to start a conversation');
             if (frame.action === 'complete') {
+              const live = children.live(child);
+              if (live) drainMessages(live.session.messages, live.info.task);
               ending = true;
               track(children.finish(child, 'complete').then(() => {}));
               send({ kind: 'event', name: 'finished', text: 'Conversation ended by you. The original window is stopping remaining work and preparing the handoff.' });
@@ -88,22 +91,26 @@ export async function serveWindows(directory: string, children: Children, availa
       });
       track(queue);
     });
+    const drainMessages = (messages: AgentMessage[], task: string) => {
+      const displayable = messages.filter(message => message.role === 'user' || message.role === 'assistant');
+      while (cursor < displayable.length) {
+        const message = displayable[cursor++];
+        let text = textContent(message.content);
+        if (message.role === 'user' && firstUser) { text = task; firstUser = false; }
+        if (text) send({ kind: 'event', name: 'message', text: `${message.role === 'user' ? 'Request / guidance' : 'Agent'}\n${text.slice(0, 200_000)}${text.length > 200_000 ? '\n[Display shortened; full text is saved in the transcript.]' : ''}` });
+      }
+    };
     const timer = setInterval(() => {
       if (!child || socket.destroyed || ending) return;
       const live = children.live(child), info = children.history.records.get(child);
       if (!info) return;
-      const messages = live?.session.messages ?? [];
-      while (cursor < messages.length) {
-        const message = messages[cursor++];
-        if (message.role !== 'user' && message.role !== 'assistant') continue;
-        let text = textContent(message.content);
-        if (message.role === 'user' && firstUser) { text = info.task; firstUser = false; }
-        if (text) send({ kind: 'event', name: 'message', text: `${message.role === 'user' ? 'Request / guidance' : 'Agent'}\n${text.slice(0, 200_000)}${text.length > 200_000 ? '\n[Display shortened; full text is saved in the transcript.]' : ''}` });
-      }
+      if (live) drainMessages(live.session.messages, info.task);
       const preview = live?.streaming && 'content' in live.streaming ? textContent(live.streaming.content).slice(-2000) : '';
       const status = `${info.state === 'waiting' ? 'Awaiting user or child reports' : info.state} · ${info.model}\n${live ? [...live.tools.values()].map(t => t.name).join(', ') : ''}\n${preview}`;
       if (status !== lastStatus) { lastStatus = status; send({ kind: 'event', name: 'status', text: status }); }
       if (!live && info.handoff?.delivered) {
+        try { drainMessages(children.messages(child), info.task); }
+        catch (error) { send({ kind: 'event', name: 'message', text: `Could not read the final transcript: ${errorText(error)}` }); }
         ending = true;
         send({ kind: 'event', name: 'finished', text: info.handoff.text ?? 'Conversation ended.' });
       }

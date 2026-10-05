@@ -83,6 +83,17 @@ export class RunHistory {
     atomicWrite(join(this.directory, `${run.id}.optchat.json`), JSON.stringify(run));
     this.records.set(run.id, run);
   }
+  descendants(id: string) {
+    const result: RunInfo[] = [], visited = new Set([id]);
+    const visit = (parent: string) => {
+      for (const run of this.records.values()) {
+        if (run.parentId !== parent || visited.has(run.id)) continue;
+        visited.add(run.id); result.push(run); visit(run.id);
+      }
+    };
+    visit(id);
+    return result;
+  }
   list() {
     const sorted = [...this.records.values()].sort((a, b) => Number(isActiveRun(b)) - Number(isActiveRun(a)) || b.started - a.started || a.id.localeCompare(b.id));
     const descendants = new Map<string, RunInfo[]>();

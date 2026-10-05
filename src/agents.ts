@@ -14,6 +14,7 @@ import { UsageLedger } from './usage.ts';
 import { textContent } from './transcript.ts';
 import { Type } from 'typebox';
 import { result } from './tools.ts';
+import type { HandoffEvidence } from './handoff.ts';
 
 export interface LiveRun {
   session: AgentSession; info: RunInfo; updated: number; streaming?: AgentMessage;
@@ -21,7 +22,7 @@ export interface LiveRun {
   pendingReports: string[]; pendingGuidance: string[]; wake?: () => void; completion?: Promise<void>;
 }
 interface Options { parentSession?: string; usage?: UsageLedger; createSession?: typeof createAgentSession;
-  summarizeHandoff?: (run: RunInfo, messages: AgentMessage[]) => Promise<string> }
+  summarizeHandoff?: (run: RunInfo, messages: AgentMessage[], descendants?: HandoffEvidence[]) => Promise<string> }
 
 export const webExtension = join(dirname(fileURLToPath(import.meta.url)), '../node_modules/pi-web-access/dist/index.js');
 export class Children {
@@ -260,13 +261,12 @@ export class Children {
     return this.history.records.get(id)?.handoff;
   }
   async recoverHandoffs() {
+    const eligible = [...this.history.records.values()].filter(run => run.connected && !this.running.has(run.id) && !run.handoff?.delivered);
     const recovery = (async () => {
-      for (const run of this.history.records.values()) {
-        if (run.connected && !this.running.has(run.id) && !run.handoff?.delivered) {
-          run.handoff ??= { reason: 'owner-stopped' };
-          run.state = run.handoff.reason === 'complete' ? 'completed' : 'interrupted'; this.save(run);
-          await this.deliverHandoff(run);
-        }
+      for (const run of eligible) {
+        run.handoff ??= { reason: 'owner-stopped' };
+        run.state = run.handoff.reason === 'complete' ? 'completed' : 'interrupted'; this.save(run);
+        await this.deliverHandoff(run);
       }
     })();
     this.completions.add(recovery);
@@ -276,15 +276,22 @@ export class Children {
     const handoff = run.handoff;
     if (!handoff || handoff.delivered) return;
     if (!handoff.text) {
+      const evidence = [run, ...this.history.descendants(run.id)].map((record): HandoffEvidence => {
+        try { return { run: record, messages: this.messages(record.id) }; }
+        catch (error) { return { run: record, messages: [], transcriptError: String(error) }; }
+      });
       let summary: string;
       try {
         if (!this.options.summarizeHandoff) throw new Error('No handoff summarizer configured');
-        summary = await this.options.summarizeHandoff(run, this.messages(run.id));
+        summary = await this.options.summarizeHandoff(run, evidence[0].messages, evidence.slice(1));
       } catch (error) {
         summary = `Automatic summary unavailable: ${String(error)}\nInitial request: ${run.task}\nLast recorded result: ${run.report ?? 'No final answer recorded.'}\nUndelivered guidance: ${run.guidance.filter(g => g.state === 'undelivered').map(g => g.text).join('\n')}\nRead the saved transcript or run metadata for the full work and user corrections.`;
       }
-      const source = run.sessionFile && existsSync(run.sessionFile) ? `Full transcript: ${run.sessionFile}`
-        : `No transcript was created. Run metadata: ${join(this.profileDirectory, 'runs', `${run.id}.optchat.json`)}`;
+      const source = evidence.map(({ run: record, transcriptError }) => {
+        const location = record.sessionFile && existsSync(record.sessionFile) ? `Full transcript: ${record.sessionFile}`
+          : `No transcript available. Run metadata: ${join(this.profileDirectory, 'runs', `${record.id}.optchat.json`)}`;
+        return `[${record.id}] ${record.state}${record.parentId ? ` · parent ${record.parentId}` : ''}\n${location}${transcriptError ? `\nTranscript read failed: ${transcriptError}` : ''}`;
+      }).join('\n');
       handoff.text = `[${run.id}] Connected conversation ${handoff.reason === 'complete' ? 'completed by user' : `interrupted (${handoff.reason})`}. This describes the conversation ending, not proof that every task succeeded.\n${summary}\n${source}`;
       run.report = handoff.text; this.save(run);
     }

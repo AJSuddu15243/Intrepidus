@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, unlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawn } from 'node:child_process';
@@ -36,6 +36,14 @@ async function fixture() {
       if (summary) summaries.push(text); else requests.push(text);
       const message: AssistantMessage = { role: 'assistant', content: [{ type: 'text', text: summary ? 'Handoff: retained the user correction and actual work.' : `Reply: ${text.split('Your task:\n').at(-1)}` }],
         api: model.api, model: model.id, provider: model.provider, stopReason: 'stop', timestamp: Date.now(), usage: emptyUsage() };
+      if (!summary && text.split('Your task:\n').at(-1) === 'provider-failure') {
+        message.stopReason = 'error'; message.errorMessage = 'Synthetic provider error';
+        message.content = [{ type: 'text', text: 'PARTIAL_FINAL_TEXT' }];
+      }
+      if (!summary && last?.role === 'user' && text.includes('descendant-evidence-task')) {
+        message.stopReason = 'toolUse';
+        message.content = [{ type: 'toolCall', id: 'evidence', name: 'bash', arguments: { command: "printf 'DESCENDANT_TESTS_PASSED_123\\n'" } }];
+      }
       if (summary && control.failSummary) { message.stopReason = 'error'; message.errorMessage = 'Synthetic summarizer unavailable'; }
       if (text === 'ask main') {
         message.content = [{ type: 'toolCall', id: 'tell-main', name: 'tell_main', arguments: { message: 'Need a decision from the main agent.' } }];
@@ -43,7 +51,7 @@ async function fixture() {
       }
       void (async () => {
         stream.push({ type: 'start', partial: message });
-        if (text.includes('hold work') && !summary) await new Promise<void>(resolve => {
+        if (!summary && (text.includes('hold work') || last?.role === 'toolResult' && text.includes('DESCENDANT_TESTS_PASSED_123'))) await new Promise<void>(resolve => {
           if (options?.signal?.aborted) resolve(); else options?.signal?.addEventListener('abort', () => resolve(), { once: true });
         });
         if (message.stopReason === 'error') stream.push({ type: 'error', reason: 'error', error: message });
@@ -187,3 +195,110 @@ test('long handoffs fold all transcript chunks, and a failed summarizer still re
     assert.equal(info.handoff?.delivered, true);
   } finally { await f.close(); }
 });
+
+test('recovery leaves newly started conversations to their own completion path', async () => {
+  const f = await fixture();
+  let releaseOld = () => {}, releaseNew = () => {};
+  const oldGate = new Promise<void>(resolve => { releaseOld = resolve; });
+  const newGate = new Promise<void>(resolve => { releaseNew = resolve; });
+  try {
+    const [old] = await f.children.spawn([{ task: 'Earlier interrupted session' }], f.dir, undefined, undefined, true);
+    await until(() => f.children.history.records.get(old)?.state === 'waiting');
+    await f.children.finish(old, 'complete');
+    const oldInfo = f.children.history.records.get(old)!;
+    oldInfo.handoff = undefined; oldInfo.state = 'interrupted'; f.children.history.save(oldInfo);
+    const calls: string[] = [];
+    f.options.summarizeHandoff = async run => {
+      calls.push(run.id); const serial = calls.length;
+      await (run.id === old ? oldGate : newGate);
+      return `Summary from call ${serial}`;
+    };
+    let recovered = false;
+    const recovery = f.children.recoverHandoffs().then(() => { recovered = true; });
+    await until(() => calls.includes(old));
+    const [fresh] = await f.children.spawn([{ task: 'New connected session' }], f.dir, undefined, undefined, true);
+    await until(() => f.children.history.records.get(fresh)?.state === 'waiting');
+    const finish = f.children.finish(fresh, 'complete');
+    await until(() => calls.includes(fresh));
+    releaseOld();
+    await until(() => recovered || calls.filter(id => id === fresh).length > 1);
+    assert.equal(recovered, true, 'recovery must finish while the new conversation is still summarizing');
+    assert.equal(calls.filter(id => id === fresh).length, 1);
+    releaseNew();
+    await Promise.all([finish, recovery]);
+    assert.equal(f.reports.filter(text => text.startsWith(`[${fresh}] Connected conversation`)).length, 1);
+  } finally { releaseOld(); releaseNew(); await f.close(); }
+});
+
+test('handoffs include stopped descendant evidence at every depth, including after restart', async () => {
+  const f = await fixture();
+  try {
+    const [parent] = await f.children.spawn([{ task: 'hold work parent' }], f.dir, undefined, undefined, true);
+    await until(() => f.requests.some(text => text.includes('hold work parent')));
+    const [child] = await f.children.spawn([{ task: 'hold work child' }], f.dir, undefined, parent);
+    await until(() => f.requests.some(text => text.includes('hold work child')));
+    const [grandchild] = await f.children.spawn([{ task: 'descendant-evidence-task' }], f.dir, undefined, child);
+    await until(() => f.requests.some(text => text.includes('DESCENDANT_TESTS_PASSED_123')));
+    await f.children.finish(parent, 'complete');
+    assert.ok(f.children.messages(grandchild).some(m => m.role === 'toolResult' && textContent(m.content).includes('DESCENDANT_TESTS_PASSED_123')));
+    const root = f.children.history.records.get(parent)!, childRun = f.children.history.records.get(child)!, grandchildRun = f.children.history.records.get(grandchild)!;
+    const checkEvidence = (handoff: string) => {
+      assert.match(f.summaries.join('\n'), /TOOL RESULT \(bash, error=false\): DESCENDANT_TESTS_PASSED_123/);
+      assert.ok(f.summaries.join('\n').includes(`AGENT ${grandchild} · parent ${child} · stopped`));
+      assert.ok(handoff.includes(grandchildRun.sessionFile!));
+      assert.ok(handoff.includes(`[${child}] stopped · parent ${parent}`));
+    };
+    checkEvidence(root.handoff!.text!);
+
+    // Recovery must use persisted relationships, and one missing transcript must not hide the others.
+    root.state = 'waiting'; root.handoff = undefined; f.children.history.save(root);
+    unlinkSync(childRun.sessionFile!); f.summaries.length = 0;
+    const recovered: string[] = [];
+    const restored = new Children(f.memory, f.registry, f.choice, () => '', async text => { recovered.push(text); }, () => {}, f.dir, f.options);
+    try {
+      await restored.recoverHandoffs();
+      assert.equal(recovered.length, 1); checkEvidence(recovered[0]);
+      assert.ok(recovered[0].includes(`No transcript available. Run metadata: ${join(f.dir, 'runs', `${child}.optchat.json`)}`));
+    } finally { await restored.close(); }
+  } finally { await f.close(); }
+});
+
+for (const scenario of ['before-first-tick', 'after-reply', 'missing-transcript'] as const) {
+  test(`provider failure drains terminal messages before finishing (${scenario})`, async t => {
+    const f = await fixture();
+    const events: WindowEvent[] = [];
+    const originalInterval = globalThis.setInterval;
+    let tick: (() => void) | undefined;
+    const interval = t.mock.method(globalThis, 'setInterval', (callback: () => void, delay: number) => {
+      if (delay === 150) { tick = callback; return originalInterval(() => {}, 10000); }
+      return originalInterval(callback, delay);
+    });
+    const close = await serveWindows(f.dir, f.children, () => true, async text => { f.reports.push(text); });
+    const client = await connectWindow(f.dir, event => events.push(event), () => {});
+    interval.mock.restore();
+    try {
+      await client.request('start', scenario === 'after-reply' ? 'Hello' : 'provider-failure', f.dir);
+      const id = events.find(e => e.name === 'started')?.text; assert.ok(id); assert.ok(tick);
+      if (scenario === 'after-reply') {
+        await until(() => f.children.history.records.get(id)?.state === 'waiting');
+        tick(); await until(() => events.filter(e => e.name === 'message').length === 2);
+        await client.request('say', 'provider-failure');
+      }
+      await until(() => f.children.history.records.get(id)?.handoff?.delivered === true);
+      assert.ok(f.children.messages(id).some(m => m.role === 'assistant' && textContent(m.content).includes('PARTIAL_FINAL_TEXT')));
+      if (scenario === 'missing-transcript') unlinkSync(f.children.history.records.get(id)!.sessionFile!);
+      tick();
+      await until(() => events.some(e => e.name === 'finished'));
+      const messages = events.filter(e => e.name === 'message');
+      if (scenario !== 'missing-transcript') {
+        assert.equal(messages.filter(e => e.text === 'Agent\nPARTIAL_FINAL_TEXT').length, 1);
+        assert.equal(messages.filter(e => e.text === 'Request / guidance\nprovider-failure').length, 1);
+        assert.equal(messages.length, scenario === 'after-reply' ? 4 : 2);
+        assert.equal(events.at(-1)?.name, 'finished');
+        assert.ok(!messages.some(e => e.text.includes('<chat>')));
+      }
+      tick();
+      assert.equal(events.filter(e => e.name === 'finished').length, 1);
+    } finally { interval.mock.restore(); client.close(); await close(); await f.close(); }
+  });
+}
