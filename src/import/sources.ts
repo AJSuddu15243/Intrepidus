@@ -78,16 +78,19 @@ export async function scanLocal(source: 'claude' | 'codex', roots?: string[], si
   // Claude workflow journals contain orchestration events, not conversation messages.
   for (const folder of folders) for (const file of await filesUnder(folder, n => n.endsWith('.jsonl') && !(source === 'claude' && n === 'journal.jsonl'), signal)) {
     signal?.throwIfAborted();
+    // Import user conversations, not separate delegated runs (including Claude's older flat layout).
+    if (source === 'claude' && (file.split(/[\\/]/).includes('subagents') || basename(file).startsWith('agent-'))) continue;
     try {
       const info = await stat(file);
       let id = basename(file, '.jsonl'), project = dirname(file), date = info.mtime.toISOString(), title = '';
+      let sidechain = false;
       for await (const { value: v } of jsonLines(file, warnings, 60, signal)) {
         if (source === 'codex' && v.type === 'session_meta' && record(v.payload)) {
           id = string(v.payload.id) ?? id; project = string(v.payload.cwd) ?? project; date = timestamp(v.payload.timestamp ?? v.timestamp, date);
         }
         if (source === 'claude') {
-          // Child logs share the parent's sessionId; their filenames distinguish the conversations.
-          id = file.includes('/subagents/') || basename(file).startsWith('agent-') ? `${string(v.sessionId) ?? basename(dirname(dirname(file)))}/${basename(file, '.jsonl')}` : string(v.sessionId) ?? id;
+          if (v.isSidechain === true) { sidechain = true; break; }
+          id = string(v.sessionId) ?? id;
           project = string(v.cwd) ?? project;
           if (v.type === 'custom-title' || v.type === 'ai-title') title = string(v.customTitle ?? v.aiTitle) ?? title;
         }
@@ -97,6 +100,7 @@ export async function scanLocal(source: 'claude' | 'codex', roots?: string[], si
           date = timestamp(v.timestamp, date);
         }
       }
+      if (sidechain) continue;
       conversations.push({ source, file, id, project, date, title: title || id, size: info.size });
     } catch (error) {
       signal?.throwIfAborted();
