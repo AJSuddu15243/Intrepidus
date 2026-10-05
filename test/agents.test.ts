@@ -182,8 +182,11 @@ test('children can message their parent mid-run: the main agent, an idle parent,
       }
       void (async () => {
         stream.push({ type: 'start', partial: message });
-        if (first) await new Promise<void>(resolve => {
-          releases.set(task, resolve); options?.signal?.addEventListener('abort', () => resolve(), { once: true });
+        // Hold each child's first turn; also hold asker-idle after its tell_parent call, so the test can
+        // prove the waiting parent hears the message while that child is still running.
+        const gate = first ? task : last?.role === 'toolResult' && task === 'asker-idle' ? 'asker-idle-after-ask' : undefined;
+        if (gate) await new Promise<void>(resolve => {
+          releases.set(gate, resolve); options?.signal?.addEventListener('abort', () => resolve(), { once: true });
           if (options?.signal?.aborted) resolve();
         });
         stream.push({ type: 'done', reason: message.stopReason === 'toolUse' ? 'toolUse' : 'stop', message });
@@ -211,8 +214,11 @@ test('children can message their parent mid-run: the main agent, an idle parent,
     releases.get('boss-idle')!();
     await until(() => children.history.records.get(idle)?.state === 'waiting');
     releases.get('asker-idle')!();
+    await until(() => heard(idle, idleChild));
+    assert.equal(children.history.records.get(idleChild)?.state, 'running', 'the waiting parent was woken mid-run, not by the child finishing');
+    assert.ok(releases.has('asker-idle-after-ask'));
+    releases.get('asker-idle-after-ask')!();
     await until(() => !children.active);
-    assert.ok(heard(idle, idleChild), 'idle parent answers the message');
     assert.equal(reports.length, 3, 'nested messages stay with the parent, not the main agent');
 
     // Busy parent gets the message as steering at its next tool boundary.
