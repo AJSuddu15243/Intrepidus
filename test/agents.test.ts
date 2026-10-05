@@ -1,11 +1,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { homedir, tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
 import { createAssistantMessageEventStream, type AssistantMessage } from '@earendil-works/pi-ai';
 import { createAgentSession, ModelRegistry, ModelRuntime } from '@earendil-works/pi-coding-agent';
-import { Children } from '../src/agents.ts';
+import { Children, taskDirectory } from '../src/agents.ts';
 import { Memory } from '../src/memory.ts';
 import { RunHistory } from '../src/runs.ts';
 import { emptyUsage, UsageLedger } from '../src/usage.ts';
@@ -285,4 +285,10 @@ test('a broken package.json above an installed extension does not block spawning
     await children.close(); rmSync(dir, { recursive: true, force: true });
     rmSync(join(agentDir, 'package.json'), { force: true }); rmSync(join(agentDir, 'extensions'), { recursive: true, force: true });
   }
+});
+
+test('a ~\\ task cwd is the home directory on Windows only', () => {
+  assert.equal(taskDirectory('/base', '~\\project', true), resolve('/base', `${homedir()}\\project`));
+  assert.equal(taskDirectory('/base', '~\\project', false), resolve('/base', '~\\project'), 'a POSIX backslash is a literal character');
+  assert.equal(taskDirectory('/base', '~/project', false), join(homedir(), 'project'));
 });

@@ -36,7 +36,8 @@ const packageName = (path: string): string | undefined => {
   }
 };
 /** A task's cwd may start with `~` and may be relative to the spawning agent's directory. */
-const taskDirectory = (cwd: string, path = '.') => resolve(cwd, path.replace(/^~(?=$|\/)/, homedir()));
+export const taskDirectory = (cwd: string, path = '.', windows = process.platform === 'win32') =>
+  resolve(cwd, path.replace(windows ? /^~(?=$|[\\/])/ : /^~(?=$|\/)/, homedir()));
 export const CWD_DOC = 'Project directory the subagent works in (~ allowed); its AGENTS.md files load from there. Defaults to your current directory.';
 const isOptchat = (path: string) => packageName(path) === 'pi-optchat';
 export class Children {

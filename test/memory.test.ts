@@ -212,3 +212,25 @@ test('an expanded /skill: command claims the input it came from, and only that o
     assert.equal(inbox.claimSkill('demox'), plain);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
+
+test('rebuilding a leaf that a saved parent already hides does not inflate the view size', async () => {
+  // A damaged tree file can lose a leaf while its parent survives; loading then merges the unbuilt leaf away.
+  const dir = mkdtempSync(join(tmpdir(), 'optchat-hidden-'));
+  mkdirSync(join(dir, 'main')); mkdirSync(join(dir, 'tree'));
+  const date = new Date().toISOString();
+  const texts = ['x'.repeat(400), 'b', 'c', 'd'];
+  writeFileSync(join(dir, 'main', `${localDay()}.jsonl`), texts.map((text, i) => JSON.stringify({ i, kind: 'user', text, date })).join('\n') + '\n');
+  const nodes = [{ l: 0, i: 1 }, { l: 0, i: 2 }, { l: 0, i: 3 }, { l: 1, i: 0 }, { l: 1, i: 1 }];
+  writeFileSync(join(dir, 'tree', `${localDay()}.jsonl`), nodes.map(n => JSON.stringify({ ...n, text: `summary ${n.l}:${n.i} padded to twenty` })).join('\n') + '\n{damaged\n');
+  const measured = (memory: Memory) => memory.render().split('\n').slice(1, -1)
+    .reduce((n, line) => n + bytes(line.slice(line.indexOf('|') + 1)), 0);
+  const memory = new Memory(dir, async () => 'top', () => {}, 80);
+  try {
+    assert.ok(memory.view.every(p => p.l > 0), 'the unbuilt leaf 0 is hidden by its saved parent');
+    assert.equal(memory.pending, 1);
+    await memory.settle(AbortSignal.timeout(3000), true);
+    assert.equal(memory.pending, 0);
+    assert.equal(memory.size, measured(memory));
+    assert.ok(memory.size <= 80);
+  } finally { await memory.close(); rmSync(dir, { recursive: true, force: true }); }
+});

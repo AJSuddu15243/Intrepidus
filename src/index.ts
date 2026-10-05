@@ -11,7 +11,7 @@ import { createCompressor } from './compactor.ts';
 import { atomicWrite, createProfile, instructions, lastProfile, listProfiles, loadConfig, lockProfile, profilePath, rememberProfile, saveConfig, ProfileBusyError, type ProfileConfig } from './profiles.ts';
 import { MASTER, VIEW_DOC } from './prompts.ts';
 import { cachePayload, record } from './cache.ts';
-import { asUser, boundedMessage, buildContext, logMessage, previousExchange, REPORT_TYPE, RUN_BOUNDARY, textContent } from './transcript.ts';
+import { asUser, boundedMessage, buildContext, logMessage, previousExchange, REPORT_TYPE, RUN_BOUNDARY, textContent, typedText } from './transcript.ts';
 import { registerReportRenderer } from './report-message.ts';
 import { memoryTools, result } from './tools.ts';
 import { Children, CWD_DOC } from './agents.ts';
@@ -252,8 +252,10 @@ export default function optchat(pi: ExtensionAPI) {
         const text = textContent(message.content);
         if (reports.includes(text)) receipts.set(message, reportReceipt(text));
         else {
-          const skill = parseSkillBlock(text);
-          let receipt = active.inbox.claim(text) ?? (skill ? active.inbox.claimSkill(skill.name, skill.userMessage) : undefined);
+          // The inbox journaled the typed input: match without image placeholders or Pi's image notes.
+          const typed = typedText(message.content), skill = parseSkillBlock(typed.bare);
+          let receipt = active.inbox.claim(typed.text) ?? active.inbox.claim(typed.bare)
+            ?? (skill ? active.inbox.claimSkill(skill.name, skill.userMessage) : undefined);
           if (!receipt) { active.inbox.record(text); receipt = active.inbox.claim(text); }
           if (receipt) receipts.set(message, receipt);
         }
