@@ -305,3 +305,42 @@ test('a child that fails to clean up still reports, is disposed, and frees its s
     ]);
   } finally { for (const release of releases.values()) release(); await children.close(); await memory.close(); rmSync(dir, { recursive: true, force: true }); }
 });
+
+test('a batch that fails mid-launch rolls back every launched child even when their cleanup throws', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'optchat-rollback-'));
+  const memory = new Memory(dir, async input => input.source.slice(0, 100), () => {});
+  const warnings: string[] = [], disposed: string[] = [];
+  const runtime = await ModelRuntime.create({ authPath: join(dir, 'auth.json'), modelsPath: null, modelsStorePath: join(dir, 'models-cache.json'), refreshOnCreate: false });
+  runtime.registerProvider('optchat-test', {
+    baseUrl: 'https://invalid.local', apiKey: 'synthetic', api: 'openai-completions',
+    models: [{ id: 'child', name: 'Synthetic child', reasoning: false, input: ['text'], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 100000, maxTokens: 1000 }],
+    streamSimple() { throw new Error('rolled-back children never run'); },
+  });
+  // The first two sessions launch with a dispose that throws; the third cannot be created.
+  let created = 0;
+  const createSession: typeof createAgentSession = async options => {
+    if (++created % 3 === 0) throw new Error('session store unavailable');
+    const made = await createAgentSession({ ...options, modelRuntime: runtime });
+    const label = `session ${created}`, dispose = made.session.dispose.bind(made.session);
+    made.session.dispose = () => { dispose(); disposed.push(label); throw new Error(`${label} dispose failed`); };
+    return made;
+  };
+  const children = new Children(memory, new ModelRegistry(runtime), () => ({ provider: 'optchat-test', model: 'child', thinking: 'minimal' }), () => '',
+    async () => {}, text => warnings.push(text), dir, { createSession });
+  try {
+    await assert.rejects(children.spawn([{ task: 'one' }, { task: 'two' }, { task: 'three' }], dir), /session store unavailable/);
+    assert.deepEqual(disposed, ['session 1', 'session 2'], 'a throwing dispose does not skip the remaining children');
+    const records = [...children.history.records.values()];
+    assert.deepEqual(records.map(r => r.task).toSorted(), ['one', 'two']);
+    for (const record of records) {
+      assert.equal(record.state, 'failed');
+      assert.match(record.report ?? '', /^Launch failed: Error: session store unavailable/);
+      assert.equal(children.live(record.id), undefined, 'a rolled-back child is no longer running');
+    }
+    assert.equal(children.active, false);
+    assert.deepEqual(warnings, ['Subagent cleanup failed: Error: session 1 dispose failed', 'Subagent cleanup failed: Error: session 2 dispose failed']);
+    // All slots are free again: a full batch is refused for its own launch error, not the profile limit.
+    created = 2;
+    await assert.rejects(children.spawn(Array.from({ length: 8 }, (_, i) => ({ task: `again ${i}` })), dir), /session store unavailable/);
+  } finally { await children.close(); await memory.close(); rmSync(dir, { recursive: true, force: true }); }
+});
