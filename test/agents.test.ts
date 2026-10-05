@@ -234,3 +234,55 @@ test('children can message their parent mid-run: the main agent, an idle parent,
     assert.deepEqual(warnings, []);
   } finally { for (const release of releases.values()) release(); await children.close(); await memory.close(); rmSync(dir, { recursive: true, force: true }); }
 });
+
+async function quickChildren(dir: string) {
+  const runtime = await ModelRuntime.create({ authPath: join(dir, 'auth.json'), modelsPath: null, modelsStorePath: join(dir, 'models-cache.json'), refreshOnCreate: false });
+  runtime.registerProvider('optchat-test', {
+    baseUrl: 'https://invalid.local', apiKey: 'synthetic', api: 'openai-completions',
+    models: [{ id: 'child', name: 'Synthetic child', reasoning: false, input: ['text'], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 100000, maxTokens: 1000 }],
+    streamSimple: model => {
+      const stream = createAssistantMessageEventStream();
+      const message: AssistantMessage = { role: 'assistant', content: [{ type: 'text', text: 'done' }], api: model.api, model: model.id, provider: model.provider, stopReason: 'stop', timestamp: Date.now(), usage: emptyUsage() };
+      queueMicrotask(() => { stream.push({ type: 'done', reason: 'stop', message }); stream.end(); });
+      return stream;
+    },
+  });
+  return new Children(new Memory(join(dir, 'profile'), async input => input.source.slice(0, 100), () => {}), new ModelRegistry(runtime), () => ({ provider: 'optchat-test', model: 'child', thinking: 'minimal' }), () => '',
+    async () => {}, () => {}, join(dir, 'profile'), { createSession: options => createAgentSession({ ...options, modelRuntime: runtime }) });
+}
+
+test('a task cwd may start with ~ or be relative to the spawning agent; a missing one is refused', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'optchat-cwd-'));
+  const oldHome = process.env.HOME;
+  mkdirSync(join(dir, 'home', 'project'), { recursive: true });
+  mkdirSync(join(dir, 'main', 'sub'), { recursive: true });
+  const children = await quickChildren(dir);
+  try {
+    process.env.HOME = join(dir, 'home');
+    const [home, relative] = await children.spawn([{ task: 'home', cwd: '~/project' }, { task: 'relative', cwd: 'sub' }], join(dir, 'main'));
+    assert.equal(children.live(home)?.info.cwd, join(dir, 'home', 'project'));
+    assert.equal(children.live(relative)?.info.cwd, join(dir, 'main', 'sub'));
+    await assert.rejects(children.spawn([{ task: 'typo', cwd: '~/projcet' }], join(dir, 'main')), /No such directory/);
+    await until(() => !children.active);
+  } finally {
+    if (oldHome === undefined) delete process.env.HOME; else process.env.HOME = oldHome;
+    await children.close(); rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a broken package.json above an installed extension does not block spawning', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'optchat-manifest-'));
+  const agentDir = process.env.PI_CODING_AGENT_DIR ?? '';
+  mkdirSync(join(agentDir, 'extensions'), { recursive: true });
+  writeFileSync(join(agentDir, 'extensions', 'web.js'), `export default (pi) => pi.registerTool({ name: 'installed_web', label: 'w', description: 'w', parameters: { type: 'object', properties: {} }, execute: async () => ({ content: [], details: {} }) });\n`);
+  writeFileSync(join(agentDir, 'package.json'), '{ "name": "half-written",');
+  const children = await quickChildren(dir);
+  try {
+    const [id] = await children.spawn([{ task: 'inspect tools' }], dir);
+    assert.ok(children.live(id)?.session.getAllTools().some(t => t.name === 'installed_web'));
+    await until(() => !children.active);
+  } finally {
+    await children.close(); rmSync(dir, { recursive: true, force: true });
+    rmSync(join(agentDir, 'package.json'), { force: true }); rmSync(join(agentDir, 'extensions'), { recursive: true, force: true });
+  }
+});
