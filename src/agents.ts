@@ -203,7 +203,7 @@ export class Children {
   private async execute(live: LiveRun, view: string) {
     const { session, info } = live;
     try {
-      if (info.connected) await this.report(`[${info.id}] User started a connected conversation in ${info.cwd}. That agent is handling this request with the user directly; don't do it yourself: ${info.task}\nUse tell with this agent ID only if you know something it needs. It stays open between replies and sends a final handoff on completion or disconnect.`);
+      if (info.connected) await this.report(`[${info.id}] User started a connected conversation in ${info.cwd}. That agent is handling this request with the user directly; don't do it yourself. Initial message: ${info.task}\n\nUse tell with this agent ID only if you know something it needs. It stays open between replies and sends a final handoff on completion or disconnect.`);
       if (this.closing || info.handoff) throw new Error('Conversation stopped before its first request.');
       await session.prompt(`${view}\n\nYour task:\n${info.task}`);
       while (info.state !== 'stopping') {
