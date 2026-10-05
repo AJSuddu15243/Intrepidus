@@ -1,6 +1,10 @@
 import type { AgentMessage } from '@earendil-works/pi-agent-core';
+import type { SessionEntry } from '@earendil-works/pi-coding-agent';
 import { getCurrentSystemMessage, type SystemMessage, type UserMessage } from '@earendil-works/pi-ai';
 import { cap, type Memory } from './memory.ts';
+import { record } from './cache.ts';
+
+export const RUN_BOUNDARY = 'optchat.run';
 
 export function textContent(content: unknown): string {
   if (typeof content === 'string') return content;
@@ -30,8 +34,8 @@ export function boundedMessage(message: AgentMessage): AgentMessage {
   if (text.length <= 30_000) return message;
   return { ...message, content: [{ type: 'text', text: cap(text) }, ...message.content.filter(c => c.type === 'image')] };
 }
-/** Snapshot before the new input arrives. Only a completed answer and its requests survive. */
-export function previousExchange(history: readonly AgentMessage[]) {
+/** The caller supplies a single settled run, including any steering after text-only replies. */
+function completedExchange(history: readonly AgentMessage[]) {
   const last = history.findLastIndex(m => m.role === 'user' || m.role === 'assistant');
   const answer = history[last];
   if (answer?.role !== 'assistant' || answer.stopReason !== 'stop'
@@ -39,13 +43,44 @@ export function previousExchange(history: readonly AgentMessage[]) {
   const content = answer.content.flatMap(block => block.type === 'text' ? [{ type: 'text' as const, text: block.text }] : []);
   if (!content.some(block => block.text.trim())) return [];
   const requests: UserMessage[] = [];
-  for (let i = last - 1; i >= 0; i--) {
-    const message = history[i];
-    if (message.role === 'assistant' && message.stopReason !== 'toolUse') break;
+  for (const message of history.slice(0, last)) {
     if (message.role === 'user') requests.push({ ...message, content: textContent(message.content) });
   }
   if (!requests.length) return [];
-  return [...requests.reverse(), { ...answer, content }];
+  return [...requests, { ...answer, content }];
+}
+
+/** Recover the latest successful run on this branch, skipping failed and unfinished runs. */
+export function previousExchange(branch: readonly SessionEntry[]) {
+  let end = -1;
+  let legacyEnd = branch.length;
+  const messages = (entries: readonly SessionEntry[]) => entries.flatMap(entry => entry.type === 'message' ? [entry.message] : []);
+  for (let i = branch.length - 1; i >= 0; i--) {
+    const entry = branch[i];
+    if (entry.type !== 'custom' || entry.customType !== RUN_BOUNDARY || !record(entry.data)) continue;
+    legacyEnd = i;
+    if (entry.data.state === 'end') end = i;
+    else if (entry.data.state === 'start') {
+      if (end >= 0) {
+        const exchange = completedExchange(messages(branch.slice(i + 1, end)));
+        if (exchange.length) return exchange;
+      }
+      end = -1;
+    }
+  }
+  // Older sessions have no run markers. Recover a successful exchange best-effort;
+  // text-only steering boundaries cannot be reconstructed for those old runs.
+  const legacy = messages(branch.slice(0, legacyEnd));
+  let boundary = 0;
+  let latest: ReturnType<typeof completedExchange> = [];
+  for (let i = 0; i < legacy.length; i++) {
+    const message = legacy[i];
+    if (message.role !== 'assistant' || message.stopReason === 'toolUse') continue;
+    const exchange = completedExchange(legacy.slice(boundary, i + 1));
+    if (exchange.length) latest = exchange;
+    boundary = i + 1;
+  }
+  return latest;
 }
 
 /** Keep one completed exchange plus the current run; all other history comes from the view. */

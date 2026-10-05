@@ -11,7 +11,7 @@ import { createCompressor } from './compactor.ts';
 import { atomicWrite, createProfile, instructions, lastProfile, listProfiles, loadConfig, lockProfile, profilePath, rememberProfile, saveConfig, type ProfileConfig } from './profiles.ts';
 import { MASTER, VIEW_DOC } from './prompts.ts';
 import { cachePayload, record } from './cache.ts';
-import { boundedMessage, buildContext, logMessage, previousExchange, textContent } from './transcript.ts';
+import { boundedMessage, buildContext, logMessage, previousExchange, RUN_BOUNDARY, textContent } from './transcript.ts';
 import { memoryTools, result } from './tools.ts';
 import { Children } from './agents.ts';
 import { exportBrowser } from './browser.ts';
@@ -162,7 +162,8 @@ export default function optchat(pi: ExtensionAPI) {
   });
   pi.on('before_agent_start', (_event, ctx) => {
     flush(); run = []; logged = 0; view = undefined; runStarted = true;
-    previous = previousExchange(ctx.sessionManager.getBranch().flatMap(entry => entry.type === 'message' ? [entry.message] : []));
+    previous = previousExchange(ctx.sessionManager.getBranch());
+    pi.appendEntry(RUN_BOUNDARY, { state: 'start' });
     const a = required();
     prompt = `${MASTER}\n\n${VIEW_DOC}\n\nFor conversational continuity, the memory view may be followed by the immediately preceding completed exchange (its user requests and final answer, in full text), then the new input. Use that exact wording to understand follow-ups; older exchanges and previous tool output remain accessible through memory and zoom.\n\n${instructions(a.dir)}\n\n${IMPORT_GUIDANCE}\n\nWorking directory: ${ctx.cwd}`;
   });
@@ -220,6 +221,7 @@ export default function optchat(pi: ExtensionAPI) {
   pi.on('agent_settled', async (_event, ctx) => {
     collectUsage(ctx);
     try { flush(); } catch (error) { fault = errorText(error); ctx.ui.notify(fault, 'error'); }
+    if (runStarted) pi.appendEntry(RUN_BOUNDARY, { state: 'end' });
     runStarted = false; status(ctx);
     if (active) {
       const dir = active.dir;
