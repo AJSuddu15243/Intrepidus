@@ -114,6 +114,7 @@ export default function optchat(pi: ExtensionAPI) {
       untitle?.(); untitle = undefined; title.clear(); working = false;
     }
   };
+  const CONNECT = 'Start a connected subagent conversation here', PICK_ANOTHER = 'Pick another profile';
   const chooseProfile = async (ctx: ExtensionContext): Promise<string | undefined> => {
     if (!ctx.hasUI) return undefined;
     const names = listProfiles(), last = lastProfile();
@@ -180,13 +181,18 @@ export default function optchat(pi: ExtensionAPI) {
     const flag = pi.getFlag('optchat-profile');
     try {
       if (boundName && typeof flag === 'string' && flag !== boundName) throw new Error(`Session belongs to ${boundName}; cannot resume it as ${flag}.`);
-      const name = boundName ?? (typeof flag === 'string' ? flag : await chooseProfile(ctx));
-      if (!name) { status(ctx); return; }
-      try { await openProfile(name, ctx); }
-      catch (error) {
-        if (!(error instanceof ProfileBusyError) || ctx.mode !== 'tui') throw error;
-        if (!await ctx.ui.confirm('Profile open in another window', `${error.owner}\nStart a connected subagent conversation here?`)) throw error;
-        remote = await openConnectedWindow(pi, ctx, name, text => title.show(t => ctx.ui.setTitle(t), text)); fault = undefined;
+      let name = boundName ?? (typeof flag === 'string' ? flag : await chooseProfile(ctx));
+      for (;;) {
+        if (!name) { status(ctx); return; }
+        try { await openProfile(name, ctx); break; }
+        catch (error) {
+          if (!(error instanceof ProfileBusyError) || ctx.mode !== 'tui') throw error;
+          // A resumed session already belongs to this profile, so another profile needs a new session (/optchat profile).
+          const choice = await ctx.ui.select(`${name} is open in another window\n${error.owner}`, boundName ? [CONNECT] : [CONNECT, PICK_ANOTHER]);
+          if (choice === CONNECT) { remote = await openConnectedWindow(pi, ctx, name, text => title.show(t => ctx.ui.setTitle(t), text)); fault = undefined; break; }
+          if (choice !== PICK_ANOTHER) throw error;
+          name = await chooseProfile(ctx);
+        }
       }
       if (!boundName) pi.appendEntry(binding, { name });
     } catch (error) {
