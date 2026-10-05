@@ -4,14 +4,15 @@ import { mkdtempSync, rmSync, unlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawn } from 'node:child_process';
-import { createAgentSession, ModelRegistry, ModelRuntime } from '@earendil-works/pi-coding-agent';
+import { createAgentSession, ModelRegistry, ModelRuntime, type ExtensionAPI, type ExtensionContext } from '@earendil-works/pi-coding-agent';
 import { createAssistantMessageEventStream, type AssistantMessage } from '@earendil-works/pi-ai';
 import { Children } from '../src/agents.ts';
 import { Memory } from '../src/memory.ts';
 import { emptyUsage, UsageLedger } from '../src/usage.ts';
 import { textContent } from '../src/transcript.ts';
 import { serveWindows, connectWindow, type WindowEvent } from '../src/window-bridge.ts';
-import { profileSocket, lockProfile } from '../src/profiles.ts';
+import { profileSocket, lockProfile, createProfile, profilePath } from '../src/profiles.ts';
+import { openConnectedWindow } from '../src/connected-window.ts';
 import { createHandoffSummarizer } from '../src/handoff.ts';
 
 // Children load installed extensions from Pi's agent dir; keep tests away from the user's real one.
@@ -146,6 +147,38 @@ test('connected window receives the real tool calls, results and live state, so 
     await f.children.spawn([{ task: 'hold work descendant' }], f.dir, undefined, id);
     await until(() => events.some(e => e.live?.agents === 1));
   } finally { client.close(); await close(); await f.close(); }
+});
+
+test('a connected window titles its tab: waiting, working, done, and disconnected', async () => {
+  const f = await fixture();
+  const oldHome = process.env.OPTCHAT_HOME;
+  process.env.OPTCHAT_HOME = mkdtempSync(join(tmpdir(), 'optchat-home-'));
+  createProfile('win');
+  const close = await serveWindows(profilePath('win'), f.children, () => true, async text => { f.reports.push(text); });
+  const titles: string[] = [];
+  let closed = false;
+  const pi = { sendMessage() {} } as unknown as ExtensionAPI;
+  const ctx = (into: string[]) => ({ cwd: f.dir, shutdown() {},
+    ui: { setStatus() {}, setWidget() {}, notify() {}, setWorkingMessage() {}, setTitle: (title: string) => into.push(title) } }) as unknown as ExtensionContext;
+  try {
+    const window = await openConnectedWindow(pi, ctx(titles), 'win');
+    assert.deepEqual(titles, ['↳ win']);
+    await window.submit('Investigate this repository.');
+    await until(() => titles.at(-1) === '↳ win' && titles.includes('● ↳ win'));
+    assert.deepEqual(titles.filter((t, i) => t !== titles[i - 1]), ['↳ win', '● ↳ win', '↳ win'], 'working while the child runs, waiting once it replies');
+    await window.complete();
+    assert.equal(titles.at(-1), '↳ win · done');
+
+    const other: string[] = [];
+    await openConnectedWindow(pi, ctx(other), 'win');
+    await close(); closed = true;
+    await until(() => other.at(-1) === '↳ win · disconnected');
+  } finally {
+    if (!closed) await close();
+    await f.close();
+    rmSync(process.env.OPTCHAT_HOME!, { recursive: true, force: true });
+    if (oldHome === undefined) delete process.env.OPTCHAT_HOME; else process.env.OPTCHAT_HOME = oldHome;
+  }
 });
 
 test('SIGKILL of the client interrupts owner-hosted work and reports it', async () => {

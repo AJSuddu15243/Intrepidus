@@ -5,6 +5,7 @@ import { connectWindow, type LiveState, type WindowEvent } from './window-bridge
 import { profilePath } from './profiles.ts';
 import { TranscriptView } from './agent-view.ts';
 import { isReport, reportBox } from './report-message.ts';
+import { statusState, windowTitle, type WindowState } from './title.ts';
 
 /** `turn` is one finished reply of the agent with the results of its tool calls, drawn like Pi draws its own turns. */
 type Details = { from?: WindowEvent['from']; turn?: AgentMessage[] };
@@ -54,7 +55,7 @@ class LiveTurn implements Component {
     const state = this.live?.state;
     // Waiting with no agents of its own means it is waiting for you, so nothing spins, like an idle Pi.
     const agents = this.live?.agents ?? 0;
-    const spin = state === 'running' || state === 'stopping' || state === 'waiting' && agents > 0;
+    const spin = !!state && statusState(state, agents) === 'working';
     this.loader.setMessage(state === 'waiting' ? `Waiting for ${agents === 1 ? '1 agent' : `${agents} agents`}` : state === 'stopping' ? 'Stopping' : 'Working');
     if (spin && !this.spinning) this.loader.start(); else if (!spin && this.spinning) this.loader.stop();
     this.spinning = spin;
@@ -65,8 +66,9 @@ class LiveTurn implements Component {
   dispose() { clearInterval(this.timer); this.loader.stop(); }
 }
 
-export async function openConnectedWindow(pi: ExtensionAPI, ctx: ExtensionContext, profile: string) {
+export async function openConnectedWindow(pi: ExtensionAPI, ctx: ExtensionContext, profile: string, setTitle: (title: string) => void = title => ctx.ui.setTitle(title)) {
   let started = false, ended = false, liveTurn: LiveTurn | undefined, live: LiveState | undefined, turn: AgentMessage[] = [];
+  const title = (state: WindowState) => setTitle(windowTitle(profile, state));
   const display = (text: string, details: Details = {}) => pi.sendMessage<Details>({ customType: 'optchat-connected', content: text, display: true, details }, { triggerTurn: false });
   const refresh = () => { if (liveTurn) { liveTurn.turn = turn; liveTurn.live = live; liveTurn.update(); } };
   /** A reply moves into the chat once all its tool calls have results, as Pi's own chat does when a tool finishes. */
@@ -81,10 +83,12 @@ export async function openConnectedWindow(pi: ExtensionAPI, ctx: ExtensionContex
   const hideLive = () => { live = undefined; liveTurn = undefined; ctx.ui.setWidget('optchat-connected', undefined); };
   const connection = await connectWindow(profilePath(profile), event => {
     if (event.name === 'started') {
-      started = true; showLive();
+      started = true; showLive(); title('working');
       ctx.ui.setStatus('optchat', `OptChat: ${profile} · connected agent ${event.text} · /complete`);
     } else if (event.name === 'status') {
       live = event.live; refresh();
+      // The tab says working exactly when the spinner spins.
+      if (!ended && live) title(statusState(live.state, live.agents));
     } else if (event.message?.role === 'assistant') {
       commit(); turn = [event.message];
       if (settled()) commit();
@@ -96,17 +100,17 @@ export async function openConnectedWindow(pi: ExtensionAPI, ctx: ExtensionContex
       commit();
       display(event.text, { from: event.from });
       if (event.name === 'finished') {
-        ended = true; hideLive();
+        ended = true; hideLive(); title('done');
         ctx.ui.setStatus('optchat', `OptChat: ${profile} · conversation ended · /complete to exit`);
       } else refresh();
     }
   }, () => {
     if (ended) return;
     ended = true; commit(); hideLive();
-    ctx.ui.setStatus('optchat', `OptChat: ${profile} · disconnected`);
+    ctx.ui.setStatus('optchat', `OptChat: ${profile} · disconnected`); title('disconnected');
     ctx.ui.notify('Connection closed. The owner saves the interrupted conversation and handoff; no local agent will run here.', 'info');
   });
-  ctx.ui.setStatus('optchat', `OptChat: ${profile} · connected window · send a task to start`);
+  ctx.ui.setStatus('optchat', `OptChat: ${profile} · connected window · send a task to start`); title('waiting');
   display(`Connected to ${profile}'s original window. Messages here go to one subagent using the profile's subagent model. /tell-main sends a message to the main agent; /complete ends this conversation and sends a handoff. Closing this window interrupts it.`);
   return {
     async submit(text: string) {
