@@ -8,11 +8,14 @@ import { textContent } from './transcript.ts';
 
 export const runStates = ['running', 'waiting', 'stopping', 'completed', 'failed', 'stopped', 'interrupted'] as const;
 export type RunState = typeof runStates[number];
+export type FinishReason = 'complete' | 'disconnected' | 'owner-stopped' | 'failed';
 export interface RunInfo {
   id: string; task: string; cwd: string; model: string; thinking: string;
   parentSession: string; sessionFile?: string; started: number; ended?: number;
   parentId?: string; depth: number;
   state: RunState; report?: string;
+  connected?: boolean;
+  handoff?: { reason: FinishReason; text?: string; delivered?: boolean };
   guidance: { text: string; date: number; state: 'queued' | 'delivered' | 'undelivered' }[];
 }
 export const isActiveRun = (run: RunInfo) => run.state === 'running' || run.state === 'waiting' || run.state === 'stopping';
@@ -23,6 +26,10 @@ function isRun(value: unknown): value is RunInfo {
     && (value.ended === undefined || typeof value.ended === 'number')
     && (value.sessionFile === undefined || typeof value.sessionFile === 'string')
     && (value.report === undefined || typeof value.report === 'string')
+    && (value.connected === undefined || typeof value.connected === 'boolean')
+    && (value.handoff === undefined || record(value.handoff) && ['complete', 'disconnected', 'owner-stopped', 'failed'].includes(String(value.handoff.reason))
+      && (value.handoff.text === undefined || typeof value.handoff.text === 'string')
+      && (value.handoff.delivered === undefined || typeof value.handoff.delivered === 'boolean'))
     && typeof value.depth === 'number' && Number.isInteger(value.depth) && value.depth >= 1 && value.depth <= 3
     && (value.parentId === undefined || typeof value.parentId === 'string')
     && Array.isArray(value.guidance) && value.guidance.every(g => record(g) && typeof g.text === 'string' && typeof g.date === 'number' && ['queued', 'delivered', 'undelivered'].includes(String(g.state)));
@@ -48,6 +55,7 @@ export class RunHistory {
         if (run.sessionFile) run.sessionFile = join(this.directory, basename(run.sessionFile));
         this.records.set(run.id, run);
         if (isActiveRun(run)) {
+          if (run.connected) run.handoff ??= { reason: 'owner-stopped' };
           run.state = 'interrupted'; run.ended = Date.now();
           run.report = 'Pi closed before this agent finished. Its partial transcript is retained.';
           for (const g of run.guidance) if (g.state === 'queued') g.state = 'undelivered';
@@ -74,6 +82,17 @@ export class RunHistory {
   save(run: RunInfo) {
     atomicWrite(join(this.directory, `${run.id}.optchat.json`), JSON.stringify(run));
     this.records.set(run.id, run);
+  }
+  descendants(id: string) {
+    const result: RunInfo[] = [], visited = new Set([id]);
+    const visit = (parent: string) => {
+      for (const run of this.records.values()) {
+        if (run.parentId !== parent || visited.has(run.id)) continue;
+        visited.add(run.id); result.push(run); visit(run.id);
+      }
+    };
+    visit(id);
+    return result;
   }
   list() {
     const sorted = [...this.records.values()].sort((a, b) => Number(isActiveRun(b)) - Number(isActiveRun(a)) || b.started - a.started || a.id.localeCompare(b.id));

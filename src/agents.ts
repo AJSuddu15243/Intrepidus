@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { existsSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createAgentSession, DefaultResourceLoader, SessionManager, SettingsManager, getAgentDir, type AgentSession, type AgentSessionEvent, type ModelRegistry } from '@earendil-works/pi-coding-agent';
@@ -8,18 +9,20 @@ import { memoryTools } from './tools.ts';
 import { type Memory } from './memory.ts';
 import type { ModelChoice } from './compactor.ts';
 import { cachePayload } from './cache.ts';
-import { RunHistory, sessionMessages, type RunInfo } from './runs.ts';
+import { RunHistory, sessionMessages, type RunInfo, type FinishReason } from './runs.ts';
 import { UsageLedger } from './usage.ts';
 import { textContent } from './transcript.ts';
 import { Type } from 'typebox';
 import { result } from './tools.ts';
+import type { HandoffEvidence } from './handoff.ts';
 
 export interface LiveRun {
   session: AgentSession; info: RunInfo; updated: number; streaming?: AgentMessage;
   tools: Map<string, { name: string; args: unknown; output?: unknown; started: number }>;
   pendingReports: string[]; pendingGuidance: string[]; wake?: () => void; completion?: Promise<void>;
 }
-interface Options { parentSession?: string; usage?: UsageLedger; createSession?: typeof createAgentSession }
+interface Options { parentSession?: string; usage?: UsageLedger; createSession?: typeof createAgentSession;
+  summarizeHandoff?: (run: RunInfo, messages: AgentMessage[], descendants?: HandoffEvidence[]) => Promise<string> }
 
 export const webExtension = join(dirname(fileURLToPath(import.meta.url)), '../node_modules/pi-web-access/dist/index.js');
 export class Children {
@@ -28,10 +31,11 @@ export class Children {
   private readonly listeners = new Set<() => void>();
   private closing = false;
   private launching = 0;
+  private settling = 0;
   private readonly completions = new Set<Promise<void>>();
   constructor(private readonly memory: Memory, private readonly registry: ModelRegistry,
     private readonly choice: () => ModelChoice, private readonly instructions: () => string,
-    private readonly report: (text: string) => Promise<void>, private readonly warn: (text: string) => void,
+    private readonly report: (text: string, once?: boolean) => Promise<void>, private readonly warn: (text: string) => void,
     private readonly profileDirectory = memory.directory, private readonly options: Options = {}) {
     this.history = new RunHistory(profileDirectory);
     for (const warning of this.history.warnings) warn(warning);
@@ -44,7 +48,7 @@ export class Children {
     }
   }
   get ids() { return [...this.running.keys()]; }
-  get active() { return this.completions.size > 0 || this.launching > 0; }
+  get active() { return this.completions.size > 0 || this.launching > 0 || this.settling > 0; }
   live(id: string) { return this.running.get(id); }
   collectUsage() {
     for (const live of this.running.values()) this.options.usage?.backfill(live.session.sessionManager.getEntries(), live.info.parentSession, 'subagent', live.info.id);
@@ -79,9 +83,10 @@ export class Children {
       this.changed();
     } catch (error) { this.warn(`Could not record subagent activity: ${String(error)}`); }
   }
-  async spawn(tasks: { task: string; cwd?: string }[], cwd: string, signal?: AbortSignal, parentId?: string) {
+  async spawn(tasks: { task: string; cwd?: string }[], cwd: string, signal?: AbortSignal, parentId?: string, connected = false) {
     if (this.closing) throw new Error('Profile is closing.');
-    await this.memory.settle(signal);
+    this.settling++;
+    try { await this.memory.settle(signal); } finally { this.settling--; }
     const parent = parentId ? this.running.get(parentId) : undefined;
     const cancelled = () => this.closing || (parentId !== undefined && this.running.get(parentId)?.info.state !== 'running');
     if (parentId && (!parent || parent.info.state !== 'running')) throw new Error('The parent is no longer running.');
@@ -102,12 +107,14 @@ export class Children {
         if (cancelled()) throw new Error('Parent or profile is stopping.');
         const id = randomUUID().slice(0, 8), directory = task.cwd ?? cwd;
         const delegation = depth < 3 ? 'You may delegate parts of your assigned task with spawn when useful. Child reports arrive automatically after your current run ends; the harness keeps you alive to receive them. Never poll, sleep, or wait in a tool for children. Finish your current work and return; you will be prompted with their results. The profile allows 8 active agents total.' : 'You are at the maximum delegation depth. Complete your task with your own tools.';
-        const prompt = `${SUBAGENT}\n\n${VIEW_DOC}\n\n${this.instructions()}\n\n${delegation}\n\nWorking directory: ${directory}`;
+        const prompt = `${SUBAGENT}\n\n${VIEW_DOC}\n\n${this.instructions()}\n\n${delegation}\n\n${connected ? 'You are speaking directly with the user in a connected window. Continue this conversation across requests. Use tell_main for questions or findings the main agent needs now. A handoff will be generated when the user completes or disconnects the window.' : ''}\n\nWorking directory: ${directory}`;
         const settingsManager = SettingsManager.inMemory({ compaction: { enabled: false }, cacheWarming: 'off' });
         const loader = new DefaultResourceLoader({ cwd: directory, agentDir: getAgentDir(), settingsManager,
           noExtensions: true, noContextFiles: true, noSkills: true, noPromptTemplates: true,
           additionalExtensionPaths: [webExtension], systemPrompt: prompt,
           extensionFactories: [pi => {
+            const provider = this.registry.getRegisteredProviderConfig(selected.provider);
+            if (provider) pi.registerProvider(selected.provider, provider);
             pi.on('before_agent_start', () => ({ systemPrompt: prompt }));
             pi.on('before_provider_request', (event, ctx) => ctx.model?.api === 'anthropic-messages' ? cachePayload(event.payload) : event.payload);
           }],
@@ -115,12 +122,17 @@ export class Children {
         await loader.reload();
         const { session } = await (this.options.createSession ?? createAgentSession)({ cwd: directory, resourceLoader: loader, settingsManager,
           model, thinkingLevel: selected.thinking, sessionManager: SessionManager.create(directory, join(this.profileDirectory, 'runs')),
-          customTools: [...memoryTools(() => this.memory), ...(depth < 3 ? this.delegationTools(id, directory) : [])],
+          customTools: [...memoryTools(() => this.memory), ...(depth < 3 ? this.delegationTools(id, directory) : []), ...(connected ? [{
+            name: 'tell_main', label: 'Message main agent', description: 'Send the main agent a question or important finding. Its reply can arrive as guidance; continue useful work instead of polling.',
+            parameters: Type.Object({ message: Type.String() }), execute: async (_id: string, args: { message: string }) => {
+              await this.report(`[${id}] Connected agent message: ${args.message}`); return result('Message sent to the main agent.');
+            },
+          }] : [])],
           excludeTools: depth < 3 ? [] : ['spawn', 'tell'],
         });
         await session.bindExtensions({});
         const info: RunInfo = { id, task: task.task, cwd: directory, model: `${selected.provider}/${selected.model}`, thinking: session.thinkingLevel,
-          parentSession: this.options.parentSession ?? '', parentId, depth, sessionFile: session.sessionFile, started: Date.now(), state: 'running', guidance: [] };
+          parentSession: this.options.parentSession ?? '', parentId, depth, sessionFile: session.sessionFile, started: Date.now(), state: 'running', guidance: [], ...(connected ? { connected: true } : {}) };
         const live: LiveRun = { session, info, updated: Date.now(), tools: new Map(), pendingReports: [], pendingGuidance: [] };
         launched.push(live); this.save(info); this.running.set(id, live);
         this.launching--; reserved--;
@@ -131,7 +143,10 @@ export class Children {
     } catch (error) {
       for (const child of launched) {
         child.session.dispose(); this.running.delete(child.info.id);
-        child.info.state = 'failed'; child.info.ended = Date.now(); child.info.report = `Launch failed: ${String(error)}`; this.save(child.info);
+        child.info.state = 'failed'; child.info.ended = Date.now(); child.info.report = `Launch failed: ${String(error)}`;
+        if (child.info.connected) child.info.handoff = { reason: signal?.aborted ? 'disconnected' : 'failed' };
+        this.save(child.info);
+        if (child.info.connected) await this.deliverHandoff(child.info).catch(error => this.warn(`Handoff saved for recovery: ${String(error)}`));
       }
       throw error;
     } finally { this.launching -= reserved; }
@@ -161,6 +176,8 @@ export class Children {
   private async execute(live: LiveRun, view: string) {
     const { session, info } = live;
     try {
+      if (info.connected) await this.report(`[${info.id}] User started a connected conversation in ${info.cwd}. Initial request: ${info.task}\nUse tell with this agent ID to coordinate. It stays open between replies and sends a final handoff on completion or disconnect.`);
+      if (this.closing || info.handoff) throw new Error('Conversation stopped before its first request.');
       await session.prompt(`${view}\n\nYour task:\n${info.task}`);
       while (info.state !== 'stopping') {
         const last = session.messages.findLast(m => m.role === 'assistant');
@@ -176,7 +193,7 @@ export class Children {
           continue;
         }
         const children = this.directChildren(info.id).flatMap(child => child.completion ? [child.completion] : []);
-        if (!children.length) break;
+        if (!children.length && !info.connected) break;
         const wake = new Promise<void>(resolve => { live.wake = resolve; });
         info.state = 'waiting'; this.save(info);
         await Promise.race([...children, wake]); live.wake = undefined;
@@ -198,6 +215,13 @@ export class Children {
       catch (error) { this.warn(`Subagent cleanup failed: ${String(error)}`); }
       finally { session.dispose(); this.running.delete(info.id); }
     }
+    if (info.connected) {
+      info.handoff ??= { reason: 'failed' };
+      info.state = info.handoff.reason === 'complete' ? 'completed' : 'interrupted';
+      this.save(info);
+      await this.deliverHandoff(info);
+      return;
+    }
     // A metadata failure must not suppress delivery of the actual result.
     try { this.save(info); } catch (error) { this.warn(`Could not save run metadata: ${String(error)}`); }
     const text = `[${info.id}] ${info.report}`;
@@ -216,7 +240,7 @@ export class Children {
   async tell(id: string, message: string, source: 'manager' | 'user' = 'manager') {
     const live = this.running.get(id);
     if (!live || !['running', 'waiting'].includes(live.info.state)) throw new Error(`No running subagent ${id}.`);
-    const text = message.trim(); if (!text) throw new Error('Message is empty.');
+    const text = live.info.connected && source === 'manager' ? `[Main agent guidance]\n${message.trim()}` : message.trim(); if (!message.trim()) throw new Error('Message is empty.');
     if (source === 'user') this.memory.append('user', `Direct guidance to subagent [${id}]: ${text}`);
     const guidance: RunInfo['guidance'][number] = { text, date: Date.now(), state: 'queued' };
     live.info.guidance.push(guidance); this.save(live.info);
@@ -227,6 +251,53 @@ export class Children {
     catch (error) { guidance.state = 'undelivered'; this.save(live.info); throw error; }
     return 'Message queued for the next tool boundary.';
   }
+  async finish(id: string, reason: FinishReason) {
+    const live = this.running.get(id);
+    if (live?.info.connected) {
+      live.info.handoff ??= { reason }; this.save(live.info);
+      await this.stop(id);
+      await live.completion;
+    }
+    return this.history.records.get(id)?.handoff;
+  }
+  async recoverHandoffs() {
+    const eligible = [...this.history.records.values()].filter(run => run.connected && !this.running.has(run.id) && !run.handoff?.delivered);
+    const recovery = (async () => {
+      for (const run of eligible) {
+        run.handoff ??= { reason: 'owner-stopped' };
+        run.state = run.handoff.reason === 'complete' ? 'completed' : 'interrupted'; this.save(run);
+        await this.deliverHandoff(run);
+      }
+    })();
+    this.completions.add(recovery);
+    try { await recovery; } finally { this.completions.delete(recovery); this.changed(); }
+  }
+  private async deliverHandoff(run: RunInfo) {
+    const handoff = run.handoff;
+    if (!handoff || handoff.delivered) return;
+    if (!handoff.text) {
+      const evidence = [run, ...this.history.descendants(run.id)].map((record): HandoffEvidence => {
+        try { return { run: record, messages: this.messages(record.id) }; }
+        catch (error) { return { run: record, messages: [], transcriptError: String(error) }; }
+      });
+      let summary: string;
+      try {
+        if (!this.options.summarizeHandoff) throw new Error('No handoff summarizer configured');
+        summary = await this.options.summarizeHandoff(run, evidence[0].messages, evidence.slice(1));
+      } catch (error) {
+        summary = `Automatic summary unavailable: ${String(error)}\nInitial request: ${run.task}\nLast recorded result: ${run.report ?? 'No final answer recorded.'}\nUndelivered guidance: ${run.guidance.filter(g => g.state === 'undelivered').map(g => g.text).join('\n')}\nRead the saved transcript or run metadata for the full work and user corrections.`;
+      }
+      const source = evidence.map(({ run: record, transcriptError }) => {
+        const location = record.sessionFile && existsSync(record.sessionFile) ? `Full transcript: ${record.sessionFile}`
+          : `No transcript available. Run metadata: ${join(this.profileDirectory, 'runs', `${record.id}.optchat.json`)}`;
+        return `[${record.id}] ${record.state}${record.parentId ? ` · parent ${record.parentId}` : ''}\n${location}${transcriptError ? `\nTranscript read failed: ${transcriptError}` : ''}`;
+      }).join('\n');
+      handoff.text = `[${run.id}] Connected conversation ${handoff.reason === 'complete' ? 'completed by user' : `interrupted (${handoff.reason})`}. This describes the conversation ending, not proof that every task succeeded.\n${summary}\n${source}`;
+      run.report = handoff.text; this.save(run);
+    }
+    await this.report(handoff.text, true);
+    handoff.delivered = true; this.save(run);
+  }
   async stop(id: string) {
     const live = this.running.get(id);
     if (!live) throw new Error(`No running subagent ${id}.`);
@@ -234,6 +305,7 @@ export class Children {
     const collect = (run: LiveRun) => { descendants.push(run); for (const child of this.directChildren(run.info.id)) collect(child); };
     collect(live);
     for (const run of descendants) {
+      if (run.info.connected) run.info.handoff ??= { reason: 'owner-stopped' };
       run.info.state = 'stopping';
       run.wake?.();
       try { this.save(run.info); } catch (error) { this.warn(`Could not save stop status: ${String(error)}`); }
