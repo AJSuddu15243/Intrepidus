@@ -10,9 +10,13 @@ import { statusState, windowTitle, type WindowState } from './title.ts';
 /** `turn` is one finished reply of the agent with the results of its tool calls, drawn like Pi draws its own turns. */
 type Details = { from?: WindowEvent['from']; turn?: AgentMessage[] };
 
-/** One transcript for the window, shared by the chat and the live widget, so tool calls keep their timings when they settle into the chat. */
+/**
+ * One transcript for the window, shared by the chat and the live widget, so tool calls keep their timings when they settle into the chat.
+ * Pi's built-in tools keep their own renderers. Other tools' definitions live in the owner's process, out of reach here, so they get the
+ * look Pi gives any registered tool without a renderer (`spawn tasks=[…]`) instead of the raw-JSON look of an unknown one.
+ */
 let transcript: TranscriptView | undefined;
-const view = (tui: TUI) => transcript ??= new TranscriptView(tui, process.cwd());
+const view = (tui: TUI) => transcript ??= new TranscriptView(tui, process.cwd(), () => ({}));
 
 /** The conversation itself renders like a normal chat; everything else keeps Pi's boxed custom-message look. */
 export function registerConnectedRenderer(pi: ExtensionAPI) {
