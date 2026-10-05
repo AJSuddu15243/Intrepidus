@@ -13,9 +13,11 @@ It runs inside ordinary Pi, with no fork or separate launcher.
 ## Install
 
 ```sh
-pi install git:github.com/jonaslsaa/pi-optchat
+pi install npm:pi-optchat
 pi install npm:pi-web-access   # optional, for web search and page fetching
 ```
+
+Or from GitHub: `pi install git:github.com/jonaslsaa/pi-optchat`.
 
 Requirements: Pi 1.0.2 or compatible, Node.js 22.19+, and Git. Tested on macOS; the offline tests also run on Linux.
 
