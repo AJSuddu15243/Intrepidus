@@ -14,7 +14,7 @@ import { cachePayload, record } from './cache.ts';
 import { asUser, boundedMessage, buildContext, logMessage, previousExchange, REPORT_TYPE, RUN_BOUNDARY, textContent } from './transcript.ts';
 import { registerReportRenderer } from './report-message.ts';
 import { memoryTools, result } from './tools.ts';
-import { Children } from './agents.ts';
+import { Children, CWD_DOC } from './agents.ts';
 import { exportBrowser } from './browser.ts';
 import { Inbox } from './inbox.ts';
 import { checkpoint } from './checkpoint.ts';
@@ -312,8 +312,8 @@ export default function optchat(pi: ExtensionAPI) {
   registerReportRenderer(pi);
   for (const tool of memoryTools(() => required().memory)) pi.registerTool(tool);
   pi.registerTool({ name: 'spawn', label: 'Spawn background agents',
-    description: 'Start background subagents, returning IDs immediately. Use only when the user asks. Each receives the current memory view and read-only zoom/date. Children may delegate two more levels; the whole profile allows 8 active agents. Completion reports arrive automatically; never poll or sleep waiting for them.',
-    parameters: Type.Object({ tasks: Type.Array(Type.Object({ task: Type.String(), cwd: Type.Optional(Type.String()) }), { minItems: 1, maxItems: 8 }) }),
+    description: 'Start background subagents, returning IDs immediately. Use only when the user asks. Give each task the cwd of the project it works on, so the subagent starts there with that project\'s AGENTS.md. Each receives the current memory view and read-only zoom/date. Children may delegate two more levels; the whole profile allows 8 active agents. Completion reports arrive automatically; never poll or sleep waiting for them.',
+    parameters: Type.Object({ tasks: Type.Array(Type.Object({ task: Type.String(), cwd: Type.Optional(Type.String({ description: CWD_DOC })) }), { minItems: 1, maxItems: 8 }) }),
     async execute(_id, args, signal, _update, ctx) {
       const ids = await required().children.spawn(args.tasks, ctx.cwd, signal); status(ctx);
       return result(`Started: ${ids.join(', ')}. Reports will arrive automatically.`);
