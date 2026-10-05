@@ -18,24 +18,27 @@ async function until(predicate: () => boolean) {
   const deadline = Date.now() + 10000;
   while (!predicate()) { if (Date.now() > deadline) throw new Error('Timed out'); await new Promise(resolve => setTimeout(resolve, 10)); }
 }
-async function fixture() {
+async function fixture(contextWindow = 1_000_000, maxTokens = 64_000) {
   const dir = mkdtempSync(join(tmpdir(), 'optchat-window-'));
   const memory = new Memory(dir, async input => input.source.slice(0, 100), () => {});
   const runtime = await ModelRuntime.create({ authPath: join(dir, 'auth.json'), modelsPath: null,
     modelsStorePath: join(dir, 'models-cache.json'), refreshOnCreate: false });
-  const control = { failSummary: false };
+  const control = { failSummary: false, truncateSummary: false, summaryText: 'Handoff: retained the user correction and actual work.' };
   const requests: string[] = [], summaries: string[] = [], reports: string[] = [], warnings: string[] = [];
+  const summaryOptions: { maxTokens?: number; systemPrompt?: string }[] = [];
   runtime.registerProvider('window-test', {
     baseUrl: 'https://invalid.local', apiKey: 'synthetic', api: 'openai-completions',
-    models: [{ id: 'child', name: 'Child', reasoning: false, input: ['text'], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 100000, maxTokens: 4000 }],
+    models: [{ id: 'child', name: 'Child', reasoning: false, input: ['text'], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow, maxTokens }],
     streamSimple(model, context, options) {
       const stream = createAssistantMessageEventStream();
       const last = context.messages.at(-1);
       const text = textContent(last && 'content' in last ? last.content : '');
       const summary = text.includes('Prior handoff:');
       if (summary) summaries.push(text); else requests.push(text);
-      const message: AssistantMessage = { role: 'assistant', content: [{ type: 'text', text: summary ? 'Handoff: retained the user correction and actual work.' : `Reply: ${text.split('Your task:\n').at(-1)}` }],
+      if (summary) summaryOptions.push({ maxTokens: options?.maxTokens, systemPrompt: textContent(context.messages.find(m => m.role === 'system')?.content) });
+      const message: AssistantMessage = { role: 'assistant', content: [{ type: 'text', text: summary ? control.summaryText : `Reply: ${text.split('Your task:\n').at(-1)}` }],
         api: model.api, model: model.id, provider: model.provider, stopReason: 'stop', timestamp: Date.now(), usage: emptyUsage() };
+      if (summary && control.truncateSummary) message.stopReason = 'length';
       if (!summary && text.split('Your task:\n').at(-1) === 'provider-failure') {
         message.stopReason = 'error'; message.errorMessage = 'Synthetic provider error';
         message.content = [{ type: 'text', text: 'PARTIAL_FINAL_TEXT' }];
@@ -56,7 +59,7 @@ async function fixture() {
         });
         if (message.stopReason === 'error') stream.push({ type: 'error', reason: 'error', error: message });
         else if (options?.signal?.aborted) { message.stopReason = 'aborted'; stream.push({ type: 'error', reason: 'aborted', error: message }); }
-        else stream.push({ type: 'done', reason: message.stopReason === 'toolUse' ? 'toolUse' : 'stop', message });
+        else stream.push({ type: 'done', reason: message.stopReason === 'toolUse' ? 'toolUse' : message.stopReason === 'length' ? 'length' : 'stop', message });
         stream.end();
       })();
       return stream;
@@ -68,7 +71,7 @@ async function fixture() {
   const options = { parentSession: 'owner', usage: ledger, createSession: (options: Parameters<typeof createAgentSession>[0]) => createAgentSession({ ...options, modelRuntime: runtime }), summarizeHandoff: summarize };
   const children = new Children(memory, registry, choice, () => '', async text => { reports.push(text); }, text => warnings.push(text), dir, options);
   const unlock = await lockProfile(dir, 'test owner');
-  return { control, dir, memory, children, requests, summaries, reports, warnings, registry, choice, options, ledger,
+  return { control, dir, memory, children, requests, summaries, summaryOptions, reports, warnings, registry, choice, options, ledger,
     async close() { await children.close(); await memory.close(); await unlock(); rmSync(dir, { recursive: true, force: true }); } };
 }
 
@@ -178,7 +181,8 @@ test('long handoffs fold all transcript chunks, and a failed summarizer still re
     const [id] = await f.children.spawn([{ task: 'Initial task' }], f.dir, undefined, undefined, true);
     await until(() => f.children.history.records.get(id)?.state === 'waiting');
     const info = f.children.history.records.get(id)!;
-    const longCorrection = 'Original detail. '.repeat(3500) + ' FINAL USER CORRECTION';
+    const longCorrection = 'Original detail. 🧠 '.repeat(70_000) + ' FINAL USER CORRECTION';
+    f.control.summaryText = 'Handoff: ' + 'Important detail. '.repeat(3000);
     const text = await f.options.summarizeHandoff(info, [
       { role: 'user', content: '<chat>PRIVATE MEMORY VIEW</chat>\n\nYour task:\nInitial task', timestamp: 1 },
       { role: 'user', content: longCorrection, timestamp: 2 },
@@ -186,6 +190,14 @@ test('long handoffs fold all transcript chunks, and a failed summarizer still re
     assert.ok(f.summaries.length >= 3);
     assert.ok(f.summaries.some(chunk => chunk.includes('FINAL USER CORRECTION')));
     assert.ok(f.summaries.every(chunk => !chunk.includes('PRIVATE MEMORY VIEW')));
+    const evidence = f.summaries.map(request => request.split('\nNext transcript chunk:\n')[1]).join('');
+    assert.ok(evidence.includes(longCorrection), 'chunking must preserve all evidence, including Unicode at boundaries');
+    for (const [i, request] of f.summaries.entries()) {
+      const inputBytes = Buffer.byteLength(request) + Buffer.byteLength(f.summaryOptions[i].systemPrompt!);
+      assert.ok(inputBytes / 4 <= 128_000, 'the prior handoff and instructions count toward the input budget');
+      if (i) assert.ok(request.includes(f.control.summaryText.trim()), 'each call includes the full prior summary');
+    }
+    assert.equal(text, f.control.summaryText.trim(), 'useful detail beyond the old word limit is retained');
     assert.match(text, /Handoff:/);
     f.control.failSummary = true;
     await f.children.finish(id, 'disconnected');
@@ -193,6 +205,55 @@ test('long handoffs fold all transcript chunks, and a failed summarizer still re
     assert.match(f.reports.at(-1) ?? '', /Automatic summary unavailable.*Synthetic summarizer unavailable/);
     assert.match(f.reports.at(-1) ?? '', /Full transcript:/);
     assert.equal(info.handoff?.delivered, true);
+  } finally { await f.close(); }
+});
+
+test('a transcript below the handoff budget is summarized in one call with a larger output allowance', async () => {
+  const f = await fixture();
+  try {
+    const [id] = await f.children.spawn([{ task: 'Initial task' }], f.dir, undefined, undefined, true);
+    await until(() => f.children.history.records.get(id)?.state === 'waiting');
+    const detail = 'Complete evidence. '.repeat(25_000);
+    await f.options.summarizeHandoff(f.children.history.records.get(id)!, [
+      { role: 'user', content: 'Initial task', timestamp: 1 },
+      { role: 'user', content: detail, timestamp: 2 },
+    ]);
+    assert.equal(f.summaries.length, 1);
+    assert.ok(f.summaries[0].includes(detail));
+    assert.equal(f.summaryOptions[0].maxTokens, 16_000);
+  } finally { await f.close(); }
+});
+
+test('handoffs respect smaller model windows and output limits while retaining all evidence', async () => {
+  const f = await fixture(32_000, 2048);
+  try {
+    const [id] = await f.children.spawn([{ task: 'Initial task' }], f.dir, undefined, undefined, true);
+    await until(() => f.children.history.records.get(id)?.state === 'waiting');
+    const detail = 'Smaller model evidence. '.repeat(10_000);
+    await f.options.summarizeHandoff(f.children.history.records.get(id)!, [
+      { role: 'user', content: 'Initial task', timestamp: 1 },
+      { role: 'user', content: detail, timestamp: 2 },
+    ]);
+    assert.ok(f.summaries.length > 1);
+    assert.ok(f.summaries.map(request => request.split('\nNext transcript chunk:\n')[1]).join('').includes(detail));
+    for (const [i, request] of f.summaries.entries()) {
+      const options = f.summaryOptions[i];
+      assert.equal(options.maxTokens, 2048);
+      assert.ok((Buffer.byteLength(request) + Buffer.byteLength(options.systemPrompt!)) / 4 + options.maxTokens <= 32_000 * 0.8);
+    }
+  } finally { await f.close(); }
+});
+
+test('a handoff truncated by the output limit reports a fallback instead of claiming to be complete', async () => {
+  const f = await fixture();
+  try {
+    const [id] = await f.children.spawn([{ task: 'Initial task' }], f.dir, undefined, undefined, true);
+    await until(() => f.children.history.records.get(id)?.state === 'waiting');
+    f.control.truncateSummary = true;
+    await f.children.finish(id, 'complete');
+    assert.match(f.reports.at(-1) ?? '', /Automatic summary unavailable.*output limit/);
+    assert.match(f.reports.at(-1) ?? '', /Full transcript:/);
+    assert.equal(f.children.history.records.get(id)?.handoff?.delivered, true);
   } finally { await f.close(); }
 });
 
