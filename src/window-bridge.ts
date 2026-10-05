@@ -52,8 +52,12 @@ function clipContent(content: unknown): unknown {
 }
 const clip = (message: AgentMessage) => ({ ...message, content: clipContent('content' in message ? message.content : []) }) as AgentMessage;
 const clipOutput = (output: unknown) => record(output) ? { ...output, content: clipContent(output.content) } : output;
-/** Huge tool arguments (a large file write) would choke the socket; the window then falls back to text. */
-const fits = (value: unknown) => JSON.stringify(value).length < 1_000_000;
+/**
+ * Huge tool arguments (a large file write) would choke the socket; the window then falls back to text.
+ * Partial tool output comes from any extension and may not serialize (a cycle, a BigInt); that falls back too
+ * instead of throwing inside the status timer, which would take the owner's Pi down with it.
+ */
+const fits = (value: unknown) => { try { return JSON.stringify(value).length < 1_000_000; } catch { return false; } };
 
 /** Local JSONL protocol, bounded before parsing; the socket is accessible only by its OS user. */
 function wire(socket: Socket, receive: (frame: Frame) => void) {

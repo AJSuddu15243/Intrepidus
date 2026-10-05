@@ -181,6 +181,12 @@ test('a connected window draws each reply with its tool results, the live turn, 
     display: true, details: message.details, timestamp: 1 }, renderer).render(100));
   const live = () => widget ? plain(widget.render(100)) : '';
   const turns = () => sent.filter(m => m.details?.turn);
+  // A turn restored before any window is live (after /reload) still draws as a tool box, not plain text.
+  const restored = { content: '', details: { from: 'agent', turn: [
+    { role: 'assistant', content: [{ type: 'toolCall', id: 'old', name: 'bash', arguments: { command: 'echo restored' } }], api: 'x', provider: 'x', model: 'x', usage: emptyUsage(), stopReason: 'toolUse', timestamp: 1 },
+    { role: 'toolResult', toolCallId: 'old', toolName: 'bash', content: [{ type: 'text', text: 'RESTORED_OUTPUT' }], isError: false, timestamp: 2 },
+  ] } };
+  assert.match(chat(restored), /\$ echo restored[\s\S]*RESTORED_OUTPUT/);
   const window = await openConnectedWindow(pi, ctx, 'draw');
   try {
     await window.submit('Investigate this repository.');

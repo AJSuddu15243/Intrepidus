@@ -16,7 +16,11 @@ type Details = { from?: WindowEvent['from']; turn?: AgentMessage[] };
  * look Pi gives any registered tool without a renderer (`spawn tasks=[…]`) instead of the raw-JSON look of an unknown one.
  */
 let transcript: TranscriptView | undefined;
-const view = (tui: TUI) => transcript ??= new TranscriptView(tui, process.cwd(), () => ({}));
+const transcriptOn = (tui: TUI) => new TranscriptView(tui, process.cwd(), () => ({}));
+const view = (tui: TUI) => transcript ??= transcriptOn(tui);
+/** Turns drawn before this window has a live view (after /reload) still get their tool boxes; there is just no live screen to redraw. */
+let detached: TranscriptView | undefined;
+const NO_SCREEN = { requestRender() {} } as unknown as TUI;
 
 /** The conversation itself renders like a normal chat; everything else keeps Pi's boxed custom-message look. */
 export function registerConnectedRenderer(pi: ExtensionAPI) {
@@ -24,10 +28,11 @@ export function registerConnectedRenderer(pi: ExtensionAPI) {
     const text = typeof message.content === 'string' ? message.content : '';
     if (message.details?.from === 'user') return new UserMessageComponent(text, getMarkdownTheme(), outputPad);
     const turn = message.details?.turn;
-    if (turn && transcript) {
-      transcript.setExpanded(expanded);
+    if (turn) {
+      const shown = transcript ?? (detached ??= transcriptOn(NO_SCREEN));
+      shown.setExpanded(expanded);
       const container = new Container();
-      for (const part of transcript.build('', turn)) container.addChild(part);
+      for (const part of shown.build('', turn)) container.addChild(part);
       return container;
     }
     if (message.details?.from === 'agent') return new Markdown(text.trim(), outputPad, 0, getMarkdownTheme());
@@ -71,6 +76,8 @@ class LiveTurn implements Component {
 }
 
 export async function openConnectedWindow(pi: ExtensionAPI, ctx: ExtensionContext, profile: string, setTitle: (title: string) => void = title => ctx.ui.setTitle(title)) {
+  // Each window draws with its own transcript, so nothing from an earlier window carries over.
+  transcript = undefined;
   let started = false, ended = false, liveTurn: LiveTurn | undefined, live: LiveState | undefined, turn: AgentMessage[] = [];
   const title = (state: WindowState) => setTitle(windowTitle(profile, state));
   const display = (text: string, details: Details = {}) => pi.sendMessage<Details>({ customType: 'optchat-connected', content: text, display: true, details }, { triggerTurn: false });
