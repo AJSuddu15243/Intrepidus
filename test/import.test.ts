@@ -91,15 +91,26 @@ test('ChatGPT preserves tool-directed analysis and every branch, orders parents 
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
-test('local discovery distinguishes Claude child conversations sharing a session ID and can be cancelled', async () => {
+test('Claude discovery keeps the parent conversation and skips modern, legacy, and sidechain child logs', async () => {
   const dir = temp(), sub = join(dir, 'session', 'subagents'); mkdirSync(sub, { recursive: true });
+  const parent = join(dir, 'session.jsonl');
+  const user = { type: 'user', sessionId: 'shared', cwd: '/project', timestamp: date, message: { role: 'user', content: 'Parent request' } };
+  lines(parent, [user, { type: 'assistant', sessionId: 'shared', message: { role: 'assistant', content: 'Child reported useful findings.' } }]);
   for (const name of ['a', 'b']) lines(join(sub, `agent-${name}.jsonl`), [{ type: 'user', sessionId: 'shared', cwd: '/project', timestamp: date, message: { role: 'user', content: name } }]);
+  lines(join(dir, 'agent-legacy.jsonl'), [user]);
+  lines(join(dir, 'renamed-child.jsonl'), [{ type: 'file-history-snapshot' }, { ...user, isSidechain: true }]);
   const workflow = join(sub, 'workflows', 'wf-fixture'); mkdirSync(workflow, { recursive: true });
   lines(join(workflow, 'journal.jsonl'), [{ type: 'started', agentId: 'a' }, { type: 'result', result: 'workflow metadata' }]);
+  lines(join(workflow, 'conversation.jsonl'), [user]);
   try {
     const scan = await scanLocal('claude', [dir]);
-    assert.deepEqual(scan.conversations.map(c => c.id).sort(), ['shared/agent-a', 'shared/agent-b']);
+    assert.deepEqual(scan.conversations.map(c => c.id), ['shared']);
+    assert.deepEqual(scan.conversations.map(c => c.file), [parent]);
     assert.ok(scan.conversations.every(c => c.project === '/project' && c.date === date));
+    const parsed = await readConversation(scan.conversations[0]);
+    assert.equal(parsed.entries.length, 2);
+    assert.match(parsed.entries[1].text, /Child reported useful findings/);
+    assert.deepEqual(scan.warnings, []);
     await assert.rejects(scanLocal('claude', [dir], AbortSignal.abort()));
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
