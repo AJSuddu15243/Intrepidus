@@ -14,6 +14,9 @@ import { serveWindows, connectWindow, type WindowEvent } from '../src/window-bri
 import { profileSocket, lockProfile } from '../src/profiles.ts';
 import { createHandoffSummarizer } from '../src/handoff.ts';
 
+// Children load installed extensions from Pi's agent dir; keep tests away from the user's real one.
+process.env.PI_CODING_AGENT_DIR = mkdtempSync(join(tmpdir(), 'optchat-agent-'));
+
 async function until(predicate: () => boolean) {
   const deadline = Date.now() + 10000;
   while (!predicate()) { if (Date.now() > deadline) throw new Error('Timed out'); await new Promise(resolve => setTimeout(resolve, 10)); }
