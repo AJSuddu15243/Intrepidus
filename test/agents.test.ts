@@ -118,7 +118,7 @@ test('real SDK children stream, deliver independently, acknowledge steering, sto
   } finally { for (const release of releases.values()) release(); await children.close(); await memory.close(); rmSync(dir, { recursive: true, force: true }); }
 });
 
-test('children load installed extensions but never another copy of OptChat', async () => {
+test('children get the main agent\'s extensions, AGENTS.md files and skills, but never another copy of OptChat', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'optchat-extensions-'));
   const agentDir = process.env.PI_CODING_AGENT_DIR ?? '';
   const tool = (name: string) => `export default (pi) => pi.registerTool({ name: '${name}', label: '${name}', description: '${name}', parameters: { type: 'object', properties: {} }, execute: async () => ({ content: [], details: {} }) });\n`;
@@ -129,19 +129,32 @@ test('children load installed extensions but never another copy of OptChat', asy
   writeFileSync(join(copy, 'package.json'), JSON.stringify({ name: 'pi-optchat', type: 'module', pi: { extensions: ['./src/index.js'] } }));
   writeFileSync(join(copy, 'src', 'index.js'), tool('optchat_copy'));
   writeFileSync(join(agentDir, 'settings.json'), JSON.stringify({ packages: [copy] }));
+  writeFileSync(join(dir, 'AGENTS.md'), 'REPO_RULES');
+  mkdirSync(join(agentDir, 'skills', 'demo-skill'), { recursive: true });
+  writeFileSync(join(agentDir, 'skills', 'demo-skill', 'SKILL.md'), '---\nname: demo-skill\ndescription: Demo skill.\n---\nBody');
+  let system = '';
   const runtime = await ModelRuntime.create({ authPath: join(dir, 'auth.json'), modelsPath: null, modelsStorePath: join(dir, 'models-cache.json'), refreshOnCreate: false });
   runtime.registerProvider('optchat-test', {
     baseUrl: 'https://invalid.local', apiKey: 'synthetic', api: 'openai-completions',
     models: [{ id: 'child', name: 'Synthetic child', reasoning: false, input: ['text'], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 100000, maxTokens: 1000 }],
-    streamSimple: () => createAssistantMessageEventStream(),
+    streamSimple: (model, context) => {
+      const head = context.messages.find(m => m.role === 'system');
+      system = Object.values(head && 'sections' in head ? head.sections ?? {} : {}).join('\n');
+      const stream = createAssistantMessageEventStream();
+      const message: AssistantMessage = { role: 'assistant', content: [{ type: 'text', text: 'done' }], api: model.api, model: model.id, provider: model.provider, stopReason: 'stop', timestamp: Date.now(), usage: emptyUsage() };
+      queueMicrotask(() => { stream.push({ type: 'done', reason: 'stop', message }); stream.end(); });
+      return stream;
+    },
   });
-  const children = new Children(new Memory(dir, async input => input.source.slice(0, 100), () => {}), new ModelRegistry(runtime), () => ({ provider: 'optchat-test', model: 'child', thinking: 'minimal' }), () => '',
+  const children = new Children(new Memory(dir, async input => input.source.slice(0, 100), () => {}), new ModelRegistry(runtime), () => ({ provider: 'optchat-test', model: 'child', thinking: 'minimal' }), () => 'PROFILE_RULES',
     async () => {}, () => {}, dir, { createSession: options => createAgentSession({ ...options, modelRuntime: runtime }) });
   try {
     const [id] = await children.spawn([{ task: 'inspect tools' }], dir);
     const names = children.live(id)?.session.getAllTools().map(t => t.name) ?? [];
     assert.ok(names.includes('installed_web'), 'installed extensions reach the child');
     assert.ok(!names.includes('optchat_copy'), 'OptChat must not load inside its own children');
-    await children.stop(id);
-  } finally { rmSync(dir, { recursive: true, force: true }); rmSync(join(agentDir, 'settings.json'), { force: true }); rmSync(join(agentDir, 'extensions'), { recursive: true, force: true }); }
+    await until(() => !children.active);
+    assert.ok(system.includes('demo-skill'), 'skills are listed like in the main agent');
+    assert.ok(system.includes('REPO_RULES') && system.indexOf('REPO_RULES') < system.lastIndexOf('PROFILE_RULES'), 'repo AGENTS.md is loaded, profile instructions come last');
+  } finally { rmSync(dir, { recursive: true, force: true }); rmSync(join(agentDir, 'settings.json'), { force: true }); rmSync(join(agentDir, 'extensions'), { recursive: true, force: true }); rmSync(join(agentDir, 'skills'), { recursive: true, force: true }); }
 });
