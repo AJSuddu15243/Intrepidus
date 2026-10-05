@@ -15,7 +15,7 @@ export function exportBrowser(memory: Memory, profile: string, directory = memor
 // Client code avoids backticks and template placeholders so it can live in String.raw.
 const PAGE = String.raw`<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>OptChat memory</title>
 <style>
-:root{--bg:#f7f3ea;--paper:#fffdf8;--ink:#2a2723;--muted:#8a8175;--rule:#e4dccd;--accent:#8a6136;--bar:#d5c7ad;--you:#3f6380;--talk:#2a2723;--work:#5b7a4f;--tool:#9a9083;--note:#a67c2e;--hl:#f6e7c1}
+:root{--bg:#f7f3ea;--paper:#fffdf8;--ink:#2a2723;--muted:#6b6357;--rule:#e4dccd;--accent:#7d5630;--bar:#d5c7ad;--you:#3f6380;--talk:#2a2723;--work:#4c6a41;--tool:#6b6357;--note:#80601f;--hl:#f6e7c1}
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;-webkit-font-smoothing:antialiased}
 .wrap{max-width:780px;margin:0 auto;padding:64px 28px 160px}
@@ -25,8 +25,8 @@ h1 small{font-size:18px;color:var(--muted);margin-left:10px}
 .explain{font-size:14px;color:var(--muted);margin:16px 0 0;max-width:620px}
 .shape{display:flex;align-items:flex-end;gap:1px;height:84px;margin:36px 0 6px}
 .shape.dense{gap:0}
-.shape span{flex:1 1 0;min-width:0;background:var(--bar);border-radius:1px;cursor:pointer}
-.shape span:hover{background:var(--accent)}
+.shape button{flex:1 1 0;min-width:0;border:0;padding:0;background:var(--bar);border-radius:1px;cursor:pointer}
+.shape button:hover,.shape button:focus-visible{background:var(--accent);outline:none}
 .axis{display:flex;justify-content:space-between;font-size:12px;color:var(--muted)}
 nav{display:flex;gap:28px;margin:48px 0 8px;border-bottom:1px solid var(--rule)}
 nav button{background:none;border:0;border-bottom:2px solid transparent;margin-bottom:-1px;padding:0 0 10px;font:inherit;color:var(--muted);cursor:pointer}
@@ -114,6 +114,16 @@ function message(e) {
   } else t.classList.remove('clamp');
   return el;
 }
+// The model sees a large message as its shortened node, so the view shows that and keeps the original one click away.
+function leaf(p) {
+  const e = D.root[p.i], n = nodes.get('0:' + p.i);
+  if (!n || n.text === e.text) return message(e);
+  const el = $('article', 'block'), kids = $('div', 'children'), b = $('button', 'link', 'Show the original');
+  el.dataset.k = '0:' + p.i; kids.hidden = true;
+  el.append($('div', 'meta', who(e)[0] + ' · ' + when(p.i, p.i) + ' · shortened for the model'), $('p', 'summary', n.text), b, kids);
+  b.onclick = () => { if (!kids.childElementCount) kids.append(message(e)); kids.hidden = !kids.hidden; b.textContent = kids.hidden ? 'Show the original' : 'Close'; };
+  return el;
+}
 function block(p) {
   if (p.l === 0) return message(D.root[p.i]);
   const a = first(p), n = nodes.get(p.l + ':' + p.i), el = $('article', 'block');
@@ -146,11 +156,12 @@ function reveal(m) {
   show('view');
   const p = holder(m); let el = view.querySelector('[data-k="' + p.l + ':' + p.i + '"]');
   for (let k = p.l; k > 0; k--) el = open(el, true).querySelector(':scope > [data-k="' + (k - 1) + ':' + Math.floor(m / 2 ** (k - 1)) + '"]');
+  if (el.matches('article')) { const b = el.querySelector(':scope > button.link'); if (b.textContent !== 'Close') b.click(); el = el.querySelector('.children > .msg'); }
   target(el);
 }
 
 document.getElementById('profile').textContent = D.profile;
-if (!D.root.length) { document.getElementById('lede').textContent = 'No messages yet.'; document.querySelector('.shape').remove(); }
+if (!D.root.length) { document.getElementById('lede').textContent = 'No messages yet.'; document.querySelector('.shape').remove(); document.querySelector('.axis').remove(); }
 else {
   const kb = n => Math.round(n / 1000).toLocaleString() + ' KB';
   document.getElementById('lede').textContent = D.root.length.toLocaleString() + ' messages since ' + day(at(0)) + '. The model sees them as ' + D.view.length.toLocaleString() + ' blocks, using ' + kb(D.size) + ' of its ' + kb(D.budget) + ' memory view.';
@@ -158,17 +169,18 @@ else {
   const shape = document.getElementById('shape'), top = Math.max(1, ...D.view.map(p => p.l));
   shape.classList.toggle('dense', D.view.length > 250);
   for (const p of D.view) {
-    const s = $('span'), a = first(p);
+    const s = $('button'), a = first(p);
     s.style.height = (6 + 78 * p.l / top) + 'px';
     s.title = when(a, a + count(p) - 1) + ' · ' + count(p).toLocaleString() + (count(p) === 1 ? ' message' : ' messages');
     s.onclick = () => { show('view'); target(view.querySelector('[data-k="' + p.l + ':' + p.i + '"]')); };
+    s.setAttribute('aria-label', s.title);
     shape.append(s);
   }
   let last = '';
   for (const p of D.view) {
     const d = at(first(p));
     if (d.toDateString() !== last) { view.append($('h2', 'day', day(d))); last = d.toDateString(); }
-    view.append(block(p));
+    view.append(p.l ? block(p) : leaf(p));
   }
 }
 
@@ -207,6 +219,8 @@ function find() {
   if (s.length < 2) return;
   const found = [];
   for (let i = D.root.length - 1; i >= 0; i--) { const j = lower[i].indexOf(s); if (j >= 0) found.push([i, j]); }
+  // Imported history is appended after native messages and may be out of date order, so sort by time.
+  found.sort((x, y) => times[y[0]] - times[x[0]] || y[0] - x[0]);
   counter.textContent = found.length ? found.length.toLocaleString() + (found.length === 1 ? ' message' : ' messages') + ', newest first' + (found.length > 100 ? ' (showing 100)' : '') : 'No messages match.';
   for (const [i, j] of found.slice(0, 100)) {
     const e = D.root[i], el = $('div', 'msg ' + who(e)[1]);
