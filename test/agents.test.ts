@@ -130,6 +130,7 @@ test('children get the main agent\'s extensions, AGENTS.md files and skills, but
   writeFileSync(join(copy, 'src', 'index.js'), tool('optchat_copy'));
   writeFileSync(join(agentDir, 'settings.json'), JSON.stringify({ packages: [copy] }));
   writeFileSync(join(dir, 'AGENTS.md'), 'REPO_RULES');
+  writeFileSync(join(agentDir, 'AGENTS.md'), 'GLOBAL_RULES');
   mkdirSync(join(agentDir, 'skills', 'demo-skill'), { recursive: true });
   writeFileSync(join(agentDir, 'skills', 'demo-skill', 'SKILL.md'), '---\nname: demo-skill\ndescription: Demo skill.\n---\nBody');
   let system = '';
@@ -155,6 +156,7 @@ test('children get the main agent\'s extensions, AGENTS.md files and skills, but
     assert.ok(!names.includes('optchat_copy'), 'OptChat must not load inside its own children');
     await until(() => !children.active);
     assert.ok(system.includes('demo-skill'), 'skills are listed like in the main agent');
-    assert.ok(system.includes('REPO_RULES') && system.indexOf('REPO_RULES') < system.lastIndexOf('PROFILE_RULES'), 'repo AGENTS.md is loaded, profile instructions come last');
-  } finally { rmSync(dir, { recursive: true, force: true }); rmSync(join(agentDir, 'settings.json'), { force: true }); rmSync(join(agentDir, 'extensions'), { recursive: true, force: true }); rmSync(join(agentDir, 'skills'), { recursive: true, force: true }); }
+    const order = ['GLOBAL_RULES', 'REPO_RULES', 'PROFILE_RULES'].map(rule => system.lastIndexOf(rule));
+    assert.ok(order.every((at, i) => at >= 0 && (i === 0 || at > order[i - 1])), 'global, then repo AGENTS.md, then profile instructions last');
+  } finally { rmSync(dir, { recursive: true, force: true }); rmSync(join(agentDir, 'settings.json'), { force: true }); rmSync(join(agentDir, 'AGENTS.md'), { force: true }); rmSync(join(agentDir, 'extensions'), { recursive: true, force: true }); rmSync(join(agentDir, 'skills'), { recursive: true, force: true }); }
 });
