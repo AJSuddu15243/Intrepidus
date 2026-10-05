@@ -25,8 +25,10 @@ export async function chooseImport(ctx: ImportUI, profile: string, memory: Memor
   let candidates = scan.conversations;
   if (!candidates.length) throw new Error(`No conversations found for this source.${scan.warnings.length ? '\n' + scan.warnings.slice(0, 4).map(clean).join('\n') : ''}`);
   if (source !== 'chatgpt') {
-    const projects = [...new Set(candidates.map(c => c.project))].sort();
-    const selected = await selectMany(ctx.ui, 'Projects', projects, p => `${p.startsWith(homedir() + '/') ? '~' + p.slice(homedir().length) : p} (${candidates.filter(c => c.project === p).length} conversations)`, signal);
+    const counts = new Map<string, number>();
+    for (const c of candidates) counts.set(c.project, (counts.get(c.project) ?? 0) + 1);
+    const projects = [...counts].sort(([a, x], [b, y]) => y - x || a.localeCompare(b)).map(([p]) => p);
+    const selected = await selectMany(ctx.ui, 'Projects', projects, p => `${p.startsWith(homedir() + '/') ? '~' + p.slice(homedir().length) : p} (${counts.get(p)} conversations)`, signal);
     if (!selected) return;
     candidates = candidates.filter(c => selected.includes(c.project));
   }
