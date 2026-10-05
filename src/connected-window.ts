@@ -10,7 +10,7 @@ export function registerConnectedRenderer(pi: ExtensionAPI) {
   pi.registerMessageRenderer<Details>('optchat-connected', (message, { outputPad }) => {
     const text = typeof message.content === 'string' ? message.content : '';
     if (message.details?.from === 'user') return new UserMessageComponent(text, getMarkdownTheme(), outputPad);
-    return message.details?.from === 'agent' ? new Markdown(text, outputPad, 0, getMarkdownTheme()) : undefined;
+    return message.details?.from === 'agent' ? new Markdown(text.trim(), outputPad, 0, getMarkdownTheme()) : undefined;
   });
 }
 

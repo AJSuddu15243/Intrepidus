@@ -99,7 +99,7 @@ export async function serveWindows(directory: string, children: Children, availa
         const message = displayable[cursor++];
         let text = textContent(message.content);
         if (message.role === 'user' && firstUser) { text = task; firstUser = false; said.add(task.trim()); }
-        const from = message.role === 'assistant' ? 'agent' : said.has(text) ? 'user' : undefined;
+        const from = message.role === 'assistant' ? 'agent' : said.has(text.trim()) ? 'user' : undefined;
         if (text) send({ kind: 'event', name: 'message', from, text: `${text.slice(0, 200_000)}${text.length > 200_000 ? '\n[Display shortened; full text is saved in the transcript.]' : ''}` });
       }
     };
