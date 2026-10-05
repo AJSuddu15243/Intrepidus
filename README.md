@@ -46,7 +46,7 @@ For headless use, pass `--optchat-profile work`.
 | `/optchat agents model` | Subagent model and effort for this profile. |
 | `/optchat usage` | Token usage and cost estimates. |
 | `/optchat instructions` | Edit this profile's `AGENTS.md`. |
-| `/optchat browse` | Open an HTML snapshot of memory: current view, every tree level, original messages. Run again to refresh. |
+| `/optchat browse` | Open a readable snapshot of memory: the shape of what the model sees, summaries you can open down to the original messages, and search that shows where each message is folded. Run again to refresh. |
 | `/optchat import` | Import history, or resume/discard a paused import. |
 | `/complete` | In a connected window: end the conversation and hand off to the main agent. |
 | `/tell-main <message>` | In a connected window: message the main agent. |
