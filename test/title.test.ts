@@ -1,4 +1,4 @@
-import { test } from 'node:test';
+import { after, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
@@ -7,12 +7,13 @@ import { createAssistantMessageEventStream, type AssistantMessage } from '@earen
 import { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager, type ExtensionUIContext } from '@earendil-works/pi-coding-agent';
 import optchat from '../src/index.ts';
 import { createProfile, loadConfig, profilePath, saveConfig } from '../src/profiles.ts';
-import { mainTitle, statusState, TabTitle, windowTitle } from '../src/title.ts';
+import { mainTitle, statusState, TabTitle, windowTitle, type StatusState } from '../src/title.ts';
 import { COMPACT } from '../src/prompts.ts';
 import { emptyUsage } from '../src/usage.ts';
 import { textContent } from '../src/transcript.ts';
 
-process.env.PI_CODING_AGENT_DIR = mkdtempSync(join(tmpdir(), 'optchat-agent-'));
+const agentDir = process.env.PI_CODING_AGENT_DIR = mkdtempSync(join(tmpdir(), 'optchat-agent-'));
+after(() => rmSync(agentDir, { recursive: true, force: true }));
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 async function until(predicate: () => boolean) {
   const deadline = Date.now() + 10000;
@@ -28,7 +29,9 @@ test('tab titles show the profile, whether the agent is working, and running sub
   assert.equal(windowTitle('personal', 'working'), '● ↳ personal');
   assert.equal(windowTitle('personal', 'done'), '↳ personal · done');
   assert.equal(windowTitle('personal', 'disconnected'), '↳ personal · disconnected');
-  assert.equal(statusState('running · child\nbash\n'), 'working');
+  // A status event never ends the conversation; the type keeps callers from expecting `done`/`disconnected`.
+  const live: StatusState = statusState('running · child\nbash\n');
+  assert.equal(live, 'working');
   assert.equal(statusState('Awaiting user or child reports · child\n\n'), 'waiting');
 });
 
