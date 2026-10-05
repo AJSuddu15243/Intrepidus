@@ -69,7 +69,7 @@ Ask in plain words, for example: "Spawn an agent to investigate this repository 
 
 - Children get the profile's memory view (frozen at launch), its instructions, read-only `zoom`/`date`, and normal coding tools plus your installed extensions.
 - Each child reports back on its own when it finishes. The parent stays alive to receive reports; it never polls.
-- The parent can send a running child guidance with `tell`.
+- The parent can send a running child guidance with `tell`, and the child can message its parent mid-run with `tell_parent` (a question, an early finding). It reaches the parent like a report, marked "still running": between tool calls if the parent is busy, or waking it if it's waiting.
 - Delegation goes up to three levels below the main agent (child, grandchild, great-grandchild).
 - At most 8 agents can be active per profile, including parents waiting on descendants. Going over a limit returns an error; there is no queue.
 - Stopping an agent stops its whole subtree. A failed parent stops its descendants.
@@ -140,7 +140,7 @@ Each profile is locked to one Pi process. If you open the same profile in a seco
 
 - Your first message starts a subagent in the second window's working directory. Later messages continue the same conversation.
 - The subagent runs inside the original process, which stays the only writer of memory. It appears in the original window's inspector and uses one of the 8 agent slots. While it is open, the original window can't switch profile or import.
-- The main agent is told when the conversation starts. Use `/tell-main <message>` to message it yourself; the subagent has a `tell_main` tool, and the main agent replies with `tell`. Routine turns don't wake the main agent.
+- The main agent is told when the conversation starts. Use `/tell-main <message>` to message it yourself; the subagent can use `tell_parent`, and the main agent replies with `tell`. Routine turns don't wake the main agent.
 - Run `/complete` when done. The window closes, remaining work stops, and the compactor writes a handoff for the main agent: decisions, changes, evidence, failures, unfinished work, and links to the transcripts.
 - Closing or force-quitting the window also produces a handoff, marked **interrupted**.
 - If the original window is closed cleanly, handoffs are delivered on next start. If it is killed, reopening the profile recovers unfinished handoffs (work is not restarted).

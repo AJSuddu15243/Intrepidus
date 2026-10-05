@@ -160,3 +160,71 @@ test('children get the main agent\'s extensions, AGENTS.md files and skills, but
     assert.ok(order.every((at, i) => at >= 0 && (i === 0 || at > order[i - 1])), 'global, then repo AGENTS.md, then profile instructions last');
   } finally { rmSync(dir, { recursive: true, force: true }); rmSync(join(agentDir, 'settings.json'), { force: true }); rmSync(join(agentDir, 'AGENTS.md'), { force: true }); rmSync(join(agentDir, 'extensions'), { recursive: true, force: true }); rmSync(join(agentDir, 'skills'), { recursive: true, force: true }); }
 });
+
+test('children can message their parent mid-run: the main agent, an idle parent, or a busy one', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'optchat-tell-parent-'));
+  const memory = new Memory(dir, async input => input.source.slice(0, 100), () => {});
+  const reports: string[] = [], warnings: string[] = [], releases = new Map<string, () => void>();
+  const runtime = await ModelRuntime.create({ authPath: join(dir, 'auth.json'), modelsPath: null, modelsStorePath: join(dir, 'models-cache.json'), refreshOnCreate: false });
+  runtime.registerProvider('optchat-test', {
+    baseUrl: 'https://invalid.local', apiKey: 'synthetic', api: 'openai-completions',
+    models: [{ id: 'child', name: 'Synthetic child', reasoning: false, input: ['text'], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 100000, maxTokens: 1000 }],
+    streamSimple(model, context, options) {
+      const stream = createAssistantMessageEventStream();
+      const task = textContent(context.messages.find(m => m.role === 'user')?.content).split('Your task:\n').at(-1) ?? '';
+      const last = context.messages.at(-1), lastText = textContent(last && 'content' in last ? last.content : '');
+      const first = context.messages.filter(m => m.role === 'assistant').length === 0;
+      const message: AssistantMessage = { role: 'assistant', content: [{ type: 'text', text: last?.role === 'toolResult' ? 'asked' : first ? `${task} working` : `${task} heard: ${lastText}` }],
+        api: model.api, provider: model.provider, model: model.id, timestamp: Date.now(), stopReason: 'stop', usage: emptyUsage() };
+      if (first && task.startsWith('asker')) {
+        message.content = [{ type: 'toolCall', id: `ask-${task}`, name: 'tell_parent', arguments: { message: `question from ${task}` } }];
+        message.stopReason = 'toolUse';
+      }
+      void (async () => {
+        stream.push({ type: 'start', partial: message });
+        if (first) await new Promise<void>(resolve => {
+          releases.set(task, resolve); options?.signal?.addEventListener('abort', () => resolve(), { once: true });
+          if (options?.signal?.aborted) resolve();
+        });
+        stream.push({ type: 'done', reason: message.stopReason === 'toolUse' ? 'toolUse' : 'stop', message });
+        stream.end();
+      })();
+      return stream;
+    },
+  });
+  const children = new Children(memory, new ModelRegistry(runtime), () => ({ provider: 'optchat-test', model: 'child', thinking: 'minimal' }), () => '',
+    async text => { reports.push(text); }, text => warnings.push(text), dir, { createSession: options => createAgentSession({ ...options, modelRuntime: runtime }) });
+  const heard = (id: string, from: string) => children.messages(id).some(m => m.role === 'assistant' && textContent(m.content).includes(`heard: [${from}] Message from subagent (still running): question from`));
+  try {
+    // Top-level child: the message reaches the main agent before the final report.
+    const [top] = await children.spawn([{ task: 'asker-top' }], dir);
+    await until(() => releases.has('asker-top'));
+    assert.ok(children.live(top)?.session.getActiveToolNames().includes('tell_parent'));
+    releases.get('asker-top')!();
+    await until(() => !children.active);
+    assert.deepEqual(reports, [`[${top}] Message from subagent (still running): question from asker-top`, `[${top}] asked`]);
+
+    // Idle parent (waiting on its child) is woken by the message.
+    const [idle] = await children.spawn([{ task: 'boss-idle' }], dir);
+    const [idleChild] = await children.spawn([{ task: 'asker-idle' }], dir, undefined, idle);
+    await until(() => releases.has('boss-idle') && releases.has('asker-idle'));
+    releases.get('boss-idle')!();
+    await until(() => children.history.records.get(idle)?.state === 'waiting');
+    releases.get('asker-idle')!();
+    await until(() => !children.active);
+    assert.ok(heard(idle, idleChild), 'idle parent answers the message');
+    assert.equal(reports.length, 3, 'nested messages stay with the parent, not the main agent');
+
+    // Busy parent gets the message as steering at its next tool boundary.
+    const [busy] = await children.spawn([{ task: 'boss-busy' }], dir);
+    const [busyChild] = await children.spawn([{ task: 'asker-busy' }], dir, undefined, busy);
+    await until(() => releases.has('boss-busy') && releases.has('asker-busy'));
+    releases.get('asker-busy')!();
+    await until(() => children.history.records.get(busyChild)?.state !== 'running');
+    releases.get('boss-busy')!();
+    await until(() => !children.active);
+    assert.ok(heard(busy, busyChild), 'busy parent sees the message after its current turn');
+    assert.equal(reports.length, 4);
+    assert.deepEqual(warnings, []);
+  } finally { for (const release of releases.values()) release(); await children.close(); await memory.close(); rmSync(dir, { recursive: true, force: true }); }
+});
