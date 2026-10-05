@@ -22,6 +22,7 @@ import { chooseImport, showProgress } from './import/ui.ts';
 import { IMPORT_GUIDANCE } from './import/guidance.ts';
 import { UsageLedger } from './usage.ts';
 import { showInspector, type InspectorPage } from './inspector.ts';
+import { showAgentView } from './agent-view.ts';
 import { inspectorShortcut, mountNavigation } from './navigation.ts';
 import { serveWindows } from './window-bridge.ts';
 import { openConnectedWindow, registerConnectedRenderer } from './connected-window.ts';
@@ -305,7 +306,9 @@ export default function optchat(pi: ExtensionAPI) {
       const action = await showInspector(ctx, { profile: a.name, session: ctx.sessionManager.getSessionId(), children: a.children, usage: a.usage, page, signal,
         refreshUsage: () => { collectUsage(ctx); try { a.children.collectUsage(); } catch (error) { ctx.ui.notify(`Could not save child usage: ${errorText(error)}`, 'error'); } },
       });
-      if (action === 'model' && !signal.aborted) await pickModel(ctx, 'subagent');
+      if (signal.aborted) return;
+      if (action === 'model') await pickModel(ctx, 'subagent');
+      else if (action) await showAgentView(ctx, { id: action.open, children: a.children, signal });
     } catch (error) { ctx.ui.notify(errorText(error), 'error'); }
     finally { if (inspectorController === controller) inspectorController = undefined; }
   };
