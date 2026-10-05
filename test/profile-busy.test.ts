@@ -11,7 +11,7 @@ const agentDir = process.env.PI_CODING_AGENT_DIR = mkdtempSync(join(tmpdir(), 'o
 after(() => rmSync(agentDir, { recursive: true, force: true }));
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
-async function start(dir: string, ui: Partial<ExtensionUIContext>, bound?: string) {
+async function start(dir: string, ui: Partial<ExtensionUIContext>, bound?: string, talked = false) {
   const runtime = await ModelRuntime.create({ authPath: join(dir, 'auth.json'), modelsPath: null,
     modelsStorePath: join(dir, 'models-cache.json'), refreshOnCreate: false });
   runtime.registerProvider('fixture', {
@@ -25,6 +25,7 @@ async function start(dir: string, ui: Partial<ExtensionUIContext>, bound?: strin
   await loader.reload();
   const manager = SessionManager.create(dir, join(dir, 'sessions'));
   if (bound) manager.appendCustomEntry('optchat.profile', { name: bound });
+  if (talked) manager.appendMessage({ role: 'user', content: 'earlier turn', timestamp: Date.now() });
   const { session } = await createAgentSession({ modelRuntime: runtime, model: runtime.getModel('fixture', 'fixture'),
     resourceLoader: loader, settingsManager, sessionManager: manager, tools: ['zoom'] });
   const titles: string[] = [], errors: string[] = [];
@@ -41,7 +42,7 @@ test('a busy profile offers to connect or pick another profile, and picking anot
   const sessions: Awaited<ReturnType<typeof start>>['session'][] = [];
   let unlock: (() => Promise<void>) | undefined;
   try {
-    for (const name of ['busy', 'other']) {
+    for (const name of ['busy', 'other', 'third']) {
       createProfile(name);
       const config = loadConfig(profilePath(name));
       saveConfig(profilePath(name), { ...config, compactor: { provider: 'fixture', model: 'fixture', thinking: 'off' }, subagent: { provider: 'fixture', model: 'fixture', thinking: 'off' } });
@@ -61,9 +62,18 @@ test('a busy profile offers to connect or pick another profile, and picking anot
     const bound = fresh.manager.getEntries().filter(e => e.type === 'custom' && e.customType === 'optchat.profile');
     assert.deepEqual(bound.map(e => e.type === 'custom' && e.data), [{ name: 'other' }], 'the session is bound to the profile actually opened');
 
-    // A resumed session already belongs to `busy`, so it can only connect (or cancel), not switch.
+    // `/optchat profile` makes a fresh session already bound to its pick; a busy pick can still go Back and rebind.
+    const switchedPicks = ['Back', 'third']; // `other` is held by the session above
+    const switched = await start(dir, { select: async () => switchedPicks.shift() }, 'busy');
+    sessions.push(switched.session);
+    assert.equal(switched.titles[0], 'π third');
+    assert.deepEqual(switched.errors, []);
+    const rebound = switched.manager.getEntries().filter(e => e.type === 'custom' && e.customType === 'optchat.profile');
+    assert.deepEqual(rebound.map(e => e.type === 'custom' && e.data), [{ name: 'busy' }, { name: 'third' }], 'the latest binding wins');
+
+    // A resumed conversation already belongs to `busy`, so it can only connect (or cancel), not switch.
     const resumedAsked: string[][] = [];
-    const resumed = await start(dir, { select: async (_title, options) => { resumedAsked.push(options); return undefined; } }, 'busy');
+    const resumed = await start(dir, { select: async (_title, options) => { resumedAsked.push(options); return undefined; } }, 'busy', true);
     sessions.push(resumed.session);
     assert.deepEqual(resumedAsked, [['Start a connected subagent conversation here']]);
     assert.match(resumed.errors.join('\n'), /Profile already running/);
