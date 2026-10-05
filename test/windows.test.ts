@@ -96,6 +96,8 @@ test('connected window keeps one real SDK conversation, communicates both ways, 
     await until(() => f.children.history.records.get(id)?.state === 'waiting');
     await f.children.tell(id, 'Main agent: proceed with tests.');
     await until(() => events.some(e => e.name === 'message' && e.text.includes('Main agent: proceed')));
+    assert.deepEqual(events.filter(e => e.from === 'user').map(e => e.text), ['Investigate this repository.', 'Correction: keep the existing API.', 'ask main']);
+    assert.equal(events.find(e => e.text.includes('Main agent: proceed'))?.from, undefined, 'main-agent guidance stays boxed');
     assert.ok(!events.some(e => e.name === 'message' && e.text.includes('<chat>')), 'frozen memory must not be rendered as user input');
     await client.request('say', 'hold work');
     await until(() => f.requests.at(-1) === 'hold work');
@@ -352,8 +354,8 @@ for (const scenario of ['before-first-tick', 'after-reply', 'missing-transcript'
       await until(() => events.some(e => e.name === 'finished'));
       const messages = events.filter(e => e.name === 'message');
       if (scenario !== 'missing-transcript') {
-        assert.equal(messages.filter(e => e.text === 'Agent\nPARTIAL_FINAL_TEXT').length, 1);
-        assert.equal(messages.filter(e => e.text === 'Request / guidance\nprovider-failure').length, 1);
+        assert.equal(messages.filter(e => e.from === 'agent' && e.text === 'PARTIAL_FINAL_TEXT').length, 1);
+        assert.equal(messages.filter(e => e.from === 'user' && e.text === 'provider-failure').length, 1);
         assert.equal(messages.length, scenario === 'after-reply' ? 4 : 2);
         assert.equal(events.at(-1)?.name, 'finished');
         assert.ok(!messages.some(e => e.text.includes('<chat>')));

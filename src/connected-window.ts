@@ -1,10 +1,22 @@
-import type { ExtensionAPI, ExtensionContext } from '@earendil-works/pi-coding-agent';
-import { connectWindow } from './window-bridge.ts';
+import { getMarkdownTheme, UserMessageComponent, type ExtensionAPI, type ExtensionContext } from '@earendil-works/pi-coding-agent';
+import { Markdown } from '@earendil-works/pi-tui';
+import { connectWindow, type WindowEvent } from './window-bridge.ts';
 import { profilePath } from './profiles.ts';
+
+type Details = { from?: WindowEvent['from'] };
+
+/** The conversation itself renders like a normal chat; everything else keeps Pi's boxed custom-message look. */
+export function registerConnectedRenderer(pi: ExtensionAPI) {
+  pi.registerMessageRenderer<Details>('optchat-connected', (message, { outputPad }) => {
+    const text = typeof message.content === 'string' ? message.content : '';
+    if (message.details?.from === 'user') return new UserMessageComponent(text, getMarkdownTheme(), outputPad);
+    return message.details?.from === 'agent' ? new Markdown(text.trim(), outputPad, 0, getMarkdownTheme()) : undefined;
+  });
+}
 
 export async function openConnectedWindow(pi: ExtensionAPI, ctx: ExtensionContext, profile: string) {
   let started = false, ended = false;
-  const display = (text: string) => pi.sendMessage({ customType: 'optchat-connected', content: text, display: true }, { triggerTurn: false });
+  const display = (text: string, from?: WindowEvent['from']) => pi.sendMessage<Details>({ customType: 'optchat-connected', content: text, display: true, details: { from } }, { triggerTurn: false });
   const connection = await connectWindow(profilePath(profile), event => {
     if (event.name === 'started') {
       started = true;
@@ -12,7 +24,7 @@ export async function openConnectedWindow(pi: ExtensionAPI, ctx: ExtensionContex
     } else if (event.name === 'status') {
       ctx.ui.setWidget('optchat-connected', event.text.split('\n').slice(-8));
     } else {
-      display(event.text);
+      display(event.text, event.from);
       if (event.name === 'finished') {
         ended = true; ctx.ui.setWidget('optchat-connected', undefined);
         ctx.ui.setStatus('optchat', `OptChat: ${profile} · conversation ended · /complete to exit`);
