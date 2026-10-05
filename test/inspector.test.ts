@@ -11,6 +11,9 @@ import { Inspector } from '../src/inspector.ts';
 import { emptyUsage, UsageLedger } from '../src/usage.ts';
 import { RunHistory } from '../src/runs.ts';
 
+// Children load installed extensions from Pi's agent dir; keep tests away from the user's real one.
+process.env.PI_CODING_AGENT_DIR = mkdtempSync(join(tmpdir(), 'optchat-agent-'));
+
 test('inspector reaches old runs, preserves selection on return, scrolls transcripts, resizes, and shuts down', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'optchat-inspector-'));
   const memory = new Memory(dir, async input => input.source.slice(0, 100), () => {});

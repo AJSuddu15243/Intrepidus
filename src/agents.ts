@@ -1,7 +1,6 @@
 import { randomUUID } from 'node:crypto';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { join, dirname } from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { createAgentSession, DefaultResourceLoader, SessionManager, SettingsManager, getAgentDir, type AgentSession, type AgentSessionEvent, type ModelRegistry } from '@earendil-works/pi-coding-agent';
 import type { AgentMessage } from '@earendil-works/pi-agent-core';
 import { SUBAGENT, VIEW_DOC } from './prompts.ts';
@@ -24,7 +23,16 @@ export interface LiveRun {
 interface Options { parentSession?: string; usage?: UsageLedger; createSession?: typeof createAgentSession;
   summarizeHandoff?: (run: RunInfo, messages: AgentMessage[], descendants?: HandoffEvidence[]) => Promise<string> }
 
-export const webExtension = join(dirname(fileURLToPath(import.meta.url)), '../node_modules/pi-web-access/dist/index.js');
+// Subagents load the user's installed extensions, except any copy of OptChat itself: they get memory tools directly and must not open a profile.
+const packageName = (path: string): string | undefined => {
+  for (let dir = dirname(path); dir !== dirname(dir); dir = dirname(dir)) {
+    const manifest = join(dir, 'package.json');
+    if (!existsSync(manifest)) continue;
+    const data: unknown = JSON.parse(readFileSync(manifest, 'utf8'));
+    return data && typeof data === 'object' && 'name' in data && typeof data.name === 'string' ? data.name : undefined;
+  }
+};
+const isOptchat = (path: string) => packageName(path) === 'pi-optchat';
 export class Children {
   private readonly running = new Map<string, LiveRun>();
   readonly history: RunHistory;
@@ -108,10 +116,11 @@ export class Children {
         const id = randomUUID().slice(0, 8), directory = task.cwd ?? cwd;
         const delegation = depth < 3 ? 'You may delegate parts of your assigned task with spawn when useful. Child reports arrive automatically after your current run ends; the harness keeps you alive to receive them. Never poll, sleep, or wait in a tool for children. Finish your current work and return; you will be prompted with their results. The profile allows 8 active agents total.' : 'You are at the maximum delegation depth. Complete your task with your own tools.';
         const prompt = `${SUBAGENT}\n\n${VIEW_DOC}\n\n${this.instructions()}\n\n${delegation}\n\n${connected ? 'You are speaking directly with the user in a connected window. Continue this conversation across requests. Use tell_main for questions or findings the main agent needs now. A handoff will be generated when the user completes or disconnects the window.' : ''}\n\nWorking directory: ${directory}`;
-        const settingsManager = SettingsManager.inMemory({ compaction: { enabled: false }, cacheWarming: 'off' });
+        // The user's settings list their installed packages; a copy in memory keeps the child from writing them back.
+        const settingsManager = SettingsManager.inMemory({ ...SettingsManager.create(directory, getAgentDir()).getSettings(), compaction: { enabled: false }, cacheWarming: 'off' });
         const loader = new DefaultResourceLoader({ cwd: directory, agentDir: getAgentDir(), settingsManager,
-          noExtensions: true, noContextFiles: true, noSkills: true, noPromptTemplates: true,
-          additionalExtensionPaths: [webExtension], systemPrompt: prompt,
+          noContextFiles: true, noSkills: true, noPromptTemplates: true, systemPrompt: prompt,
+          extensionsOverride: base => ({ ...base, extensions: base.extensions.filter(e => !isOptchat(e.resolvedPath)) }),
           extensionFactories: [pi => {
             const provider = this.registry.getRegisteredProviderConfig(selected.provider);
             if (provider) pi.registerProvider(selected.provider, provider);

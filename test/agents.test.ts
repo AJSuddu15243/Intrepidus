@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createAssistantMessageEventStream, type AssistantMessage } from '@earendil-works/pi-ai';
@@ -10,6 +10,9 @@ import { Memory } from '../src/memory.ts';
 import { RunHistory } from '../src/runs.ts';
 import { emptyUsage, UsageLedger } from '../src/usage.ts';
 import { textContent } from '../src/transcript.ts';
+
+// Children load installed extensions from Pi's agent dir; keep tests away from the user's real one.
+process.env.PI_CODING_AGENT_DIR = mkdtempSync(join(tmpdir(), 'optchat-agent-'));
 
 async function until(condition: () => boolean) {
   const deadline = Date.now() + 10000;
@@ -113,4 +116,32 @@ test('real SDK children stream, deliver independently, acknowledge steering, sto
     for (const id of [stopRoot, stopChild, stopLeaf]) assert.equal(children.history.records.get(id)?.state, 'stopped');
     assert.deepEqual(warnings, []);
   } finally { for (const release of releases.values()) release(); await children.close(); await memory.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('children load installed extensions but never another copy of OptChat', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'optchat-extensions-'));
+  const agentDir = process.env.PI_CODING_AGENT_DIR ?? '';
+  const tool = (name: string) => `export default (pi) => pi.registerTool({ name: '${name}', label: '${name}', description: '${name}', parameters: { type: 'object', properties: {} }, execute: async () => ({ content: [], details: {} }) });\n`;
+  mkdirSync(join(agentDir, 'extensions'), { recursive: true });
+  writeFileSync(join(agentDir, 'extensions', 'web.js'), tool('installed_web'));
+  const copy = join(dir, 'optchat-copy');
+  mkdirSync(join(copy, 'src'), { recursive: true });
+  writeFileSync(join(copy, 'package.json'), JSON.stringify({ name: 'pi-optchat', type: 'module', pi: { extensions: ['./src/index.js'] } }));
+  writeFileSync(join(copy, 'src', 'index.js'), tool('optchat_copy'));
+  writeFileSync(join(agentDir, 'settings.json'), JSON.stringify({ packages: [copy] }));
+  const runtime = await ModelRuntime.create({ authPath: join(dir, 'auth.json'), modelsPath: null, modelsStorePath: join(dir, 'models-cache.json'), refreshOnCreate: false });
+  runtime.registerProvider('optchat-test', {
+    baseUrl: 'https://invalid.local', apiKey: 'synthetic', api: 'openai-completions',
+    models: [{ id: 'child', name: 'Synthetic child', reasoning: false, input: ['text'], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 100000, maxTokens: 1000 }],
+    streamSimple: () => createAssistantMessageEventStream(),
+  });
+  const children = new Children(new Memory(dir, async input => input.source.slice(0, 100), () => {}), new ModelRegistry(runtime), () => ({ provider: 'optchat-test', model: 'child', thinking: 'minimal' }), () => '',
+    async () => {}, () => {}, dir, { createSession: options => createAgentSession({ ...options, modelRuntime: runtime }) });
+  try {
+    const [id] = await children.spawn([{ task: 'inspect tools' }], dir);
+    const names = children.live(id)?.session.getAllTools().map(t => t.name) ?? [];
+    assert.ok(names.includes('installed_web'), 'installed extensions reach the child');
+    assert.ok(!names.includes('optchat_copy'), 'OptChat must not load inside its own children');
+    await children.stop(id);
+  } finally { rmSync(dir, { recursive: true, force: true }); rmSync(join(agentDir, 'settings.json'), { force: true }); rmSync(join(agentDir, 'extensions'), { recursive: true, force: true }); }
 });
