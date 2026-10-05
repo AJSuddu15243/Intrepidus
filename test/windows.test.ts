@@ -57,7 +57,10 @@ async function fixture(contextWindow = 1_000_000, maxTokens = 64_000) {
       }
       void (async () => {
         stream.push({ type: 'start', partial: message });
-        if (!summary && (text.includes('hold work') || last?.role === 'toolResult' && text.includes('DESCENDANT_TESTS_PASSED_123'))) await new Promise<void>(resolve => {
+        const hold = !summary && (text.includes('hold work') || last?.role === 'toolResult' && text.includes('DESCENDANT_TESTS_PASSED_123'));
+        // A held reply is mid-stream, as a real one would be while the model is still writing.
+        if (hold) stream.push({ type: 'text_delta', contentIndex: 0, delta: 'Reply', partial: message });
+        if (hold) await new Promise<void>(resolve => {
           if (options?.signal?.aborted) resolve(); else options?.signal?.addEventListener('abort', () => resolve(), { once: true });
         });
         if (message.stopReason === 'error') stream.push({ type: 'error', reason: 'error', error: message });
@@ -120,6 +123,28 @@ test('connected window keeps one real SDK conversation, communicates both ways, 
     await f.children.recoverHandoffs();
     assert.equal(f.summaries.length, 1, 'delivered handoffs must not be repeated');
     assert.deepEqual(f.warnings, []);
+  } finally { client.close(); await close(); await f.close(); }
+});
+
+test('connected window receives the real tool calls, results and live state, so it can draw them like Pi', async () => {
+  const f = await fixture();
+  const events: WindowEvent[] = [];
+  const close = await serveWindows(f.dir, f.children, () => true, async text => { f.reports.push(text); });
+  const client = await connectWindow(f.dir, event => events.push(event), () => {});
+  try {
+    await client.request('start', 'descendant-evidence-task', f.dir);
+    const id = events.find(e => e.name === 'started')?.text; assert.ok(id);
+    // The fake model calls bash, then holds its next reply open, so the window sees a streaming reply.
+    await until(() => events.some(e => e.message?.role === 'toolResult'));
+    const call = events.find(e => e.message?.role === 'assistant')?.message;
+    assert.ok(call?.role === 'assistant' && call.content.some(p => p.type === 'toolCall' && p.name === 'bash' && p.id === 'evidence'));
+    const result = events.find(e => e.message?.role === 'toolResult')?.message;
+    assert.ok(result?.role === 'toolResult' && result.toolCallId === 'evidence' && textContent(result.content).includes('DESCENDANT_TESTS_PASSED_123'));
+    await until(() => events.some(e => e.live?.streaming));
+    const live = events.findLast(e => e.live)?.live;
+    assert.equal(live?.state, 'running'); assert.equal(live?.model, 'window-test/child');
+    await f.children.spawn([{ task: 'hold work descendant' }], f.dir, undefined, id);
+    await until(() => events.some(e => e.live?.agents === 1));
   } finally { client.close(); await close(); await f.close(); }
 });
 

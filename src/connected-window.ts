@@ -1,38 +1,108 @@
-import { getMarkdownTheme, UserMessageComponent, type ExtensionAPI, type ExtensionContext } from '@earendil-works/pi-coding-agent';
-import { Markdown } from '@earendil-works/pi-tui';
-import { connectWindow, type WindowEvent } from './window-bridge.ts';
+import { getMarkdownTheme, UserMessageComponent, type ExtensionAPI, type ExtensionContext, type Theme } from '@earendil-works/pi-coding-agent';
+import { Container, Loader, Markdown, type Component, type TUI } from '@earendil-works/pi-tui';
+import type { AgentMessage } from '@earendil-works/pi-agent-core';
+import { connectWindow, type LiveState, type WindowEvent } from './window-bridge.ts';
 import { profilePath } from './profiles.ts';
+import { TranscriptView } from './agent-view.ts';
+import { isReport, reportBox } from './report-message.ts';
 
-type Details = { from?: WindowEvent['from'] };
+/** `turn` is one finished reply of the agent with the results of its tool calls, drawn like Pi draws its own turns. */
+type Details = { from?: WindowEvent['from']; turn?: AgentMessage[] };
+
+/** One transcript for the window, shared by the chat and the live widget, so tool calls keep their timings when they settle into the chat. */
+let transcript: TranscriptView | undefined;
+const view = (tui: TUI) => transcript ??= new TranscriptView(tui, process.cwd());
 
 /** The conversation itself renders like a normal chat; everything else keeps Pi's boxed custom-message look. */
 export function registerConnectedRenderer(pi: ExtensionAPI) {
-  pi.registerMessageRenderer<Details>('optchat-connected', (message, { outputPad }) => {
+  pi.registerMessageRenderer<Details>('optchat-connected', (message, { expanded, outputPad }, theme) => {
     const text = typeof message.content === 'string' ? message.content : '';
     if (message.details?.from === 'user') return new UserMessageComponent(text, getMarkdownTheme(), outputPad);
-    return message.details?.from === 'agent' ? new Markdown(text.trim(), outputPad, 0, getMarkdownTheme()) : undefined;
+    const turn = message.details?.turn;
+    if (turn && transcript) {
+      transcript.setExpanded(expanded);
+      const container = new Container();
+      for (const part of transcript.build('', turn)) container.addChild(part);
+      return container;
+    }
+    if (message.details?.from === 'agent') return new Markdown(text.trim(), outputPad, 0, getMarkdownTheme());
+    // Reports from the agent's own subagents get the same dark box as in the main window.
+    return isReport(text) ? reportBox(text, outputPad, theme) : undefined;
   });
 }
 
+const toolCalls = (message: AgentMessage) => message.role === 'assistant' ? message.content.flatMap(part => part.type === 'toolCall' ? [part.id] : []) : [];
+
+/** What normally sits at the bottom of Pi's chat while it works: the streaming reply, running tools and the working spinner. */
+class LiveTurn implements Component {
+  private readonly loader: Loader;
+  private readonly body = new Container();
+  private spinning = false;
+  turn: AgentMessage[] = [];
+  live?: LiveState;
+  constructor(private readonly tui: TUI, theme: Theme) {
+    this.loader = new Loader(tui, text => theme.fg('accent', text), text => theme.fg('muted', text), 'Working');
+    // Running tools show their elapsed time, which only moves when they are redrawn.
+    this.timer = setInterval(() => { if (this.live?.tools.length) this.update(); }, 1000); this.timer.unref();
+  }
+  private readonly timer: ReturnType<typeof setInterval>;
+  update() {
+    const streaming = this.live?.streaming;
+    const running = new Map((this.live?.tools ?? []).map(t => [t.id, { output: t.output, started: t.started }] as const));
+    this.body.clear();
+    for (const part of view(this.tui).build('', streaming ? [...this.turn, streaming] : this.turn, streaming, running)) this.body.addChild(part);
+    const state = this.live?.state;
+    // Waiting with no agents of its own means it is waiting for you, so nothing spins, like an idle Pi.
+    const agents = this.live?.agents ?? 0;
+    const spin = state === 'running' || state === 'stopping' || state === 'waiting' && agents > 0;
+    this.loader.setMessage(state === 'waiting' ? `Waiting for ${agents === 1 ? '1 agent' : `${agents} agents`}` : state === 'stopping' ? 'Stopping' : 'Working');
+    if (spin && !this.spinning) this.loader.start(); else if (!spin && this.spinning) this.loader.stop();
+    this.spinning = spin;
+    this.tui.requestRender();
+  }
+  render(width: number) { return [...this.body.render(width), ...(this.spinning ? this.loader.render(width) : [])]; }
+  invalidate() { this.body.invalidate(); this.loader.invalidate(); }
+  dispose() { clearInterval(this.timer); this.loader.stop(); }
+}
+
 export async function openConnectedWindow(pi: ExtensionAPI, ctx: ExtensionContext, profile: string) {
-  let started = false, ended = false;
-  const display = (text: string, from?: WindowEvent['from']) => pi.sendMessage<Details>({ customType: 'optchat-connected', content: text, display: true, details: { from } }, { triggerTurn: false });
+  let started = false, ended = false, liveTurn: LiveTurn | undefined, live: LiveState | undefined, turn: AgentMessage[] = [];
+  const display = (text: string, details: Details = {}) => pi.sendMessage<Details>({ customType: 'optchat-connected', content: text, display: true, details }, { triggerTurn: false });
+  const refresh = () => { if (liveTurn) { liveTurn.turn = turn; liveTurn.live = live; liveTurn.update(); } };
+  /** A reply moves into the chat once all its tool calls have results, as Pi's own chat does when a tool finishes. */
+  const commit = () => {
+    if (!turn.length) return;
+    const [reply] = turn;
+    display(reply.role === 'assistant' ? reply.content.flatMap(p => p.type === 'text' ? [p.text] : []).join('\n') : '', { from: 'agent', turn });
+    turn = [];
+  };
+  const settled = () => { const done = new Set(turn.flatMap(m => m.role === 'toolResult' ? [m.toolCallId] : [])); return turn.length > 0 && toolCalls(turn[0]).every(id => done.has(id)); };
+  const showLive = () => ctx.ui.setWidget('optchat-connected', (tui, theme) => { view(tui); liveTurn = new LiveTurn(tui, theme); refresh(); return liveTurn; });
+  const hideLive = () => { live = undefined; liveTurn = undefined; ctx.ui.setWidget('optchat-connected', undefined); };
   const connection = await connectWindow(profilePath(profile), event => {
     if (event.name === 'started') {
-      started = true;
+      started = true; showLive();
       ctx.ui.setStatus('optchat', `OptChat: ${profile} · connected agent ${event.text} · /complete`);
     } else if (event.name === 'status') {
-      ctx.ui.setWidget('optchat-connected', event.text.split('\n').slice(-8));
+      live = event.live; refresh();
+    } else if (event.message?.role === 'assistant') {
+      commit(); turn = [event.message];
+      if (settled()) commit();
+      refresh();
+    } else if (event.message?.role === 'toolResult') {
+      if (turn.length) { turn.push(event.message); if (settled()) commit(); }
+      refresh();
     } else {
-      display(event.text, event.from);
+      commit();
+      display(event.text, { from: event.from });
       if (event.name === 'finished') {
-        ended = true; ctx.ui.setWidget('optchat-connected', undefined);
+        ended = true; hideLive();
         ctx.ui.setStatus('optchat', `OptChat: ${profile} · conversation ended · /complete to exit`);
-      }
+      } else refresh();
     }
   }, () => {
     if (ended) return;
-    ended = true; ctx.ui.setWidget('optchat-connected', undefined);
+    ended = true; commit(); hideLive();
     ctx.ui.setStatus('optchat', `OptChat: ${profile} · disconnected`);
     ctx.ui.notify('Connection closed. The owner saves the interrupted conversation and handoff; no local agent will run here.', 'info');
   });
