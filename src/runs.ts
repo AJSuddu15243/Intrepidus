@@ -16,7 +16,8 @@ export interface RunInfo {
   state: RunState; report?: string;
   connected?: boolean;
   handoff?: { reason: FinishReason; text?: string; delivered?: boolean };
-  guidance: { text: string; date: number; state: 'queued' | 'delivered' | 'undelivered' }[];
+  /** `from` is missing on runs saved before senders were recorded. */
+  guidance: { text: string; date: number; state: 'queued' | 'delivered' | 'undelivered'; from?: 'user' | 'manager' }[];
 }
 export const isActiveRun = (run: RunInfo) => run.state === 'running' || run.state === 'waiting' || run.state === 'stopping';
 function isRun(value: unknown): value is RunInfo {
@@ -32,7 +33,7 @@ function isRun(value: unknown): value is RunInfo {
       && (value.handoff.delivered === undefined || typeof value.handoff.delivered === 'boolean'))
     && typeof value.depth === 'number' && Number.isInteger(value.depth) && value.depth >= 1 && value.depth <= 3
     && (value.parentId === undefined || typeof value.parentId === 'string')
-    && Array.isArray(value.guidance) && value.guidance.every(g => record(g) && typeof g.text === 'string' && typeof g.date === 'number' && ['queued', 'delivered', 'undelivered'].includes(String(g.state)));
+    && Array.isArray(value.guidance) && value.guidance.every(g => record(g) && typeof g.text === 'string' && typeof g.date === 'number' && ['queued', 'delivered', 'undelivered'].includes(String(g.state)) && (g.from === undefined || g.from === 'user' || g.from === 'manager'));
 }
 export function sessionMessages(file: string): AgentMessage[] {
   return SessionManager.open(file).getEntries().flatMap(e => e.type === 'message' ? [e.message] : []);
