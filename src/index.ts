@@ -24,7 +24,7 @@ import { UsageLedger } from './usage.ts';
 import { showInspector, type InspectorPage } from './inspector.ts';
 import { inspectorShortcut, mountNavigation } from './navigation.ts';
 import { serveWindows } from './window-bridge.ts';
-import { openConnectedWindow } from './connected-window.ts';
+import { openConnectedWindow, registerConnectedRenderer } from './connected-window.ts';
 import { createHandoffSummarizer } from './handoff.ts';
 
 const binding = 'optchat.profile';
@@ -263,6 +263,7 @@ export default function optchat(pi: ExtensionAPI) {
       await checkpoints;
     }
   });
+  registerConnectedRenderer(pi);
   for (const tool of memoryTools(() => required().memory)) pi.registerTool(tool);
   pi.registerTool({ name: 'spawn', label: 'Spawn background agents',
     description: 'Start background subagents, returning IDs immediately. Use only when the user asks. Each receives the current memory view and read-only zoom/date. Children may delegate two more levels; the whole profile allows 8 active agents. Completion reports arrive automatically; never poll or sleep waiting for them.',

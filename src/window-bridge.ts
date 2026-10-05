@@ -9,14 +9,15 @@ import { textContent } from './transcript.ts';
 type Action = 'start' | 'say' | 'tell-main' | 'complete';
 interface Request { kind: 'request'; id: number; action: Action; text?: string; cwd?: string }
 interface Reply { kind: 'reply'; id: number; error?: string }
-export interface WindowEvent { kind: 'event'; name: 'started' | 'message' | 'status' | 'finished'; text: string }
+/** `from` marks the conversation itself (your messages and the agent's replies); other messages have no `from`. */
+export interface WindowEvent { kind: 'event'; name: 'started' | 'message' | 'status' | 'finished'; text: string; from?: 'user' | 'agent' }
 type Frame = Request | Reply | WindowEvent;
 const errorText = (error: unknown) => error instanceof Error ? error.message : String(error);
 function parse(value: unknown): Frame {
   if (!record(value)) throw new Error('Invalid window message');
-  const name = value.name, action = value.action;
+  const name = value.name, action = value.action, from = value.from;
   if (value.kind === 'event' && (name === 'started' || name === 'message' || name === 'status' || name === 'finished') && typeof value.text === 'string')
-    return { kind: 'event', name, text: value.text };
+    return { kind: 'event', name, text: value.text, from: from === 'user' || from === 'agent' ? from : undefined };
   if (typeof value.id !== 'number' || !Number.isSafeInteger(value.id)) throw new Error('Invalid request ID');
   if (value.kind === 'reply' && (value.error === undefined || typeof value.error === 'string')) return { kind: 'reply', id: value.id, error: value.error };
   if (value.kind === 'request' && (action === 'start' || action === 'say' || action === 'tell-main' || action === 'complete')
@@ -57,6 +58,7 @@ export async function serveWindows(directory: string, children: Children, availa
     if (closing) { socket.destroy(); return; }
     connections.add(socket);
     let child: string | undefined, cursor = 0, firstUser = true, lastStatus = '', ending = false;
+    const said = new Set<string>(); // Main-agent guidance and child reports reach the session as user messages too.
     const controller = new AbortController();
     let queue = Promise.resolve();
     const track = (promise: Promise<void>) => { work.add(promise); void promise.finally(() => work.delete(promise)).catch(() => {}); };
@@ -82,7 +84,7 @@ export async function serveWindows(directory: string, children: Children, availa
               send({ kind: 'event', name: 'finished', text: 'Conversation ended by you. The original window is stopping remaining work and preparing the handoff.' });
             } else {
               if (!frame.text?.trim()) throw new Error('Message is empty');
-              if (frame.action === 'say') await children.tell(child, frame.text, 'user');
+              if (frame.action === 'say') { said.add(frame.text.trim()); await children.tell(child, frame.text, 'user'); }
               else await report(`[${child}] User message from connected window: ${frame.text}`);
             }
           }
@@ -96,8 +98,9 @@ export async function serveWindows(directory: string, children: Children, availa
       while (cursor < displayable.length) {
         const message = displayable[cursor++];
         let text = textContent(message.content);
-        if (message.role === 'user' && firstUser) { text = task; firstUser = false; }
-        if (text) send({ kind: 'event', name: 'message', text: `${message.role === 'user' ? 'Request / guidance' : 'Agent'}\n${text.slice(0, 200_000)}${text.length > 200_000 ? '\n[Display shortened; full text is saved in the transcript.]' : ''}` });
+        if (message.role === 'user' && firstUser) { text = task; firstUser = false; said.add(task.trim()); }
+        const from = message.role === 'assistant' ? 'agent' : said.has(text) ? 'user' : undefined;
+        if (text) send({ kind: 'event', name: 'message', from, text: `${text.slice(0, 200_000)}${text.length > 200_000 ? '\n[Display shortened; full text is saved in the transcript.]' : ''}` });
       }
     };
     const timer = setInterval(() => {
