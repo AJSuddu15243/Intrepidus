@@ -177,7 +177,7 @@ async function claudeProject(folder: string, name: string, signal?: AbortSignal)
   const transcripts = (await readdir(folder)).filter(f => f.endsWith('.jsonl')).sort();
   for (const transcript of transcripts) {
     try {
-      for await (const { value } of jsonLines(join(folder, transcript), [], 20, signal)) {
+      for await (const { value } of jsonLines(join(folder, transcript), [], 60, signal)) {
         const cwd = string(value.cwd);
         if (cwd && cwd.replace(/[^a-zA-Z0-9]/g, '-') === name) return cwd;
       }
@@ -201,8 +201,8 @@ function unquote(value: string): string {
   return value;
 }
 async function readMemory(c: Conversation, signal?: AbortSignal): Promise<{ entries: ImportedEntry[]; warnings: string[] }> {
-  let content: string;
-  try { content = await readFile(c.file, { encoding: 'utf8', signal }); } catch (error) {
+  let content: string, modified: Date;
+  try { [content, { mtime: modified }] = await Promise.all([readFile(c.file, { encoding: 'utf8', signal }), stat(c.file)]); } catch (error) {
     signal?.throwIfAborted();
     if (!missingSource(error)) throw error;
     return { entries: [], warnings: [`${c.file}: memory file is no longer available; skipped.`] };
@@ -213,9 +213,11 @@ async function readMemory(c: Conversation, signal?: AbortSignal): Promise<{ entr
   const name = one(fields.get('name') ?? c.title), type = fields.get('type'), description = fields.get('description');
   // The whole file is the identity, so an edited memory arrives as a newer note and an unchanged one is skipped.
   const hash = digest(content);
-  return { warnings: [], entries: [{ kind: 'note', date: c.date,
+  // Date the note from this read, not the earlier scan, in case Claude edited the file meanwhile.
+  const date = timestamp(fields.get('modified'), modified.toISOString());
+  return { warnings: [], entries: [{ kind: 'note', date,
     origin: { source: c.source, conversation: c.id, message: hash.slice(0, 16), title: name, project: c.project },
-    text: `[Historical Claude Code memory · ${c.date} · project ${c.project}${type ? ` · type ${one(type)}` : ''} · ${name}]\n${description ? one(description) + '\n\n' : ''}${body.trim()}`,
+    text: `[Historical Claude Code memory · ${date} · project ${c.project}${type ? ` · type ${one(type)}` : ''} · ${name}]\n${description ? one(description) + '\n\n' : ''}${body.trim()}`,
     receipt: `import:${digest(JSON.stringify([c.source, c.id, hash]))}` }] };
 }
 

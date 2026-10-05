@@ -297,7 +297,7 @@ test('Claude memories import each topic file once as a dated note, and an edited
     assert.deepEqual(deduplicate(existing, await read()), { added: [], skipped: 2 });
     writeFileSync(pr, readFileSync(pr, 'utf8').replace('is open', 'is merged'));
     const { added } = deduplicate(existing, await read());
-    assert.equal(added.length, 1); assert.match(added[0].text, /PR #7023 is merged/);
+    assert.equal(added.length, 1); assert.match(added[0].text, /PR #7023 is merged/); assert.ok(added[0].date > date, 'edited note is dated by the read, not the scan');
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
