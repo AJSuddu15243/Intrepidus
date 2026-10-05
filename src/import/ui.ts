@@ -46,7 +46,7 @@ export async function chooseImport(ctx: ImportUI, profile: string, memory: Memor
   const scope = await ctx.ui.select(`${candidates.length} ${unit} · ${size(candidates.reduce((n, c) => n + c.size, 0))} source files`, [`All matching ${unit}`, `Choose individual ${unit}`], { signal });
   if (!scope) return;
   const conversations: Conversation[] | undefined = scope === `Choose individual ${unit}`
-    ? await selectMany(ctx.ui, 'Conversations', candidates, c => `${c.date.slice(0, 10)} · ${c.title} · ${c.id}`, signal) : candidates;
+    ? await selectMany(ctx.ui, source === 'claude-memory' ? 'Memories' : 'Conversations', candidates, c => `${c.date.slice(0, 10)} · ${c.title} · ${c.id}`, signal) : candidates;
   if (!conversations) return;
   const entries: ImportedEntry[] = [], warnings = [...scan.warnings];
   try {
@@ -78,7 +78,7 @@ export async function chooseImport(ctx: ImportUI, profile: string, memory: Memor
   let nodes = 0;
   for (let n = memory.root.length + added.length; n > 0; n = Math.floor(n / 2)) nodes += n;
   if (mode === 'append') nodes -= memory.tree.size;
-  const preview = `${profile} · ${mode}\n${source === 'claude-memory' ? 'Each memory file as one dated historical note; MEMORY.md indexes excluded.' : 'Historical user messages and final replies; tool activity excluded.'}\n${conversations.length} ${unit} selected · ${added.length} new messages · ${skipped} duplicates skipped\n${size(inputBytes)} text to index (~${Math.ceil(inputBytes / 4).toLocaleString()} source tokens; rough estimate)\nCompactor: ${model}\nUp to ${nodes} new summary nodes; small nodes need no model call. Context and retries add usage.\nChatting in this profile pauses until completion or discard. You can pause and resume compression. The previous memory is retained.`;
+  const preview = `${profile} · ${mode}\n${source === 'claude-memory' ? 'Each memory file as one dated historical note; MEMORY.md indexes excluded.' : 'Historical user messages and final replies; tool activity excluded.'}\n${conversations.length} ${unit} selected · ${added.length} new ${source === 'claude-memory' ? 'notes' : 'messages'} · ${skipped} duplicates skipped\n${size(inputBytes)} text to index (~${Math.ceil(inputBytes / 4).toLocaleString()} source tokens; rough estimate)\nCompactor: ${model}\nUp to ${nodes} new summary nodes; small nodes need no model call. Context and retries add usage.\nChatting in this profile pauses until completion or discard. You can pause and resume compression. The previous memory is retained.`;
   if (!await ctx.ui.confirm('Start import?', preview, { signal })) return;
   return { entries, mode };
 }
