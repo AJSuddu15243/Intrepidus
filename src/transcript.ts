@@ -5,6 +5,8 @@ import { cap, type Memory } from './memory.ts';
 import { record } from './cache.ts';
 
 export const RUN_BOUNDARY = 'optchat.run';
+/** Subagent traffic to the main agent: a custom message on screen, a plain user message to the model and memory. */
+export const REPORT_TYPE = 'optchat-report';
 
 export function textContent(content: unknown): string {
   if (typeof content === 'string') return content;
@@ -15,6 +17,11 @@ export function textContent(content: unknown): string {
     if ('type' in part && part.type === 'image') return '[image attachment: available in Pi session; text memory does not preserve image bytes]';
     return '';
   }).filter(Boolean).join('\n');
+}
+/** Reports reach the model, memory and the previous-exchange replay exactly as the user messages they used to be. */
+export function asUser(message: AgentMessage): AgentMessage {
+  if (message.role !== 'custom' || message.customType !== REPORT_TYPE) return message;
+  return { role: 'user', content: textContent(message.content), timestamp: message.timestamp };
 }
 export function logMessage(memory: Memory, message: AgentMessage, receipt?: string) {
   const date = new Date(message.timestamp).toISOString();
@@ -54,7 +61,7 @@ function completedExchange(history: readonly AgentMessage[]) {
 export function previousExchange(branch: readonly SessionEntry[]) {
   let end = -1;
   let legacyEnd = branch.length;
-  const messages = (entries: readonly SessionEntry[]) => entries.flatMap(entry => entry.type === 'message' ? [entry.message] : []);
+  const messages = (entries: readonly SessionEntry[]) => entries.flatMap(entry => entry.type === 'message' ? [asUser(entry.message)] : entry.type === 'custom_message' && entry.customType === REPORT_TYPE ? [asUser({ role: 'custom', customType: entry.customType, content: entry.content, display: entry.display, timestamp: Date.parse(entry.timestamp) })] : []);
   for (let i = branch.length - 1; i >= 0; i--) {
     const entry = branch[i];
     if (entry.type !== 'custom' || entry.customType !== RUN_BOUNDARY || !record(entry.data)) continue;
