@@ -1,4 +1,5 @@
 import { chmodSync, closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { createConnection, createServer } from 'node:net';
 import { homedir, tmpdir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
@@ -21,11 +22,22 @@ export function profilePath(name: string) {
 }
 export function teamOf(dir: string): { root: string; me: string } | undefined {
   const root = dirname(dir);
-  return dirname(root) === join(dataHome(), 'teams') ? { root, me: basename(dir) } : undefined;
+  return dirname(root) === join(dataHome(), 'teams') && existsSync(join(root, '.git')) ? { root, me: basename(dir) } : undefined;
 }
 export function listProfiles() {
   const root = join(dataHome(), 'profiles');
-  return existsSync(root) ? readdirSync(root, { withFileTypes: true }).filter(f => f.isDirectory() && NAME.test(f.name)).map(f => f.name).sort() : [];
+  const profiles = existsSync(root) ? readdirSync(root, { withFileTypes: true }).filter(f => f.isDirectory() && NAME.test(f.name)).map(f => f.name) : [];
+  const teams = join(dataHome(), 'teams');
+  const teamProfiles: string[] = [];
+  if (existsSync(teams)) for (const entry of readdirSync(teams, { withFileTypes: true })) {
+    if (!entry.isDirectory() || !NAME.test(entry.name)) continue;
+    const teamRoot = join(teams, entry.name);
+    let handle = '';
+    try { handle = execFileSync('git', ['-C', teamRoot, 'config', '--get', 'intrepidus.handle'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim(); }
+    catch { continue; }
+    if (handle && NAME.test(handle) && statSync(join(teamRoot, handle), { throwIfNoEntry: false })?.isDirectory()) teamProfiles.push(`${entry.name}/${handle}`);
+  }
+  return [...profiles.sort(), ...teamProfiles.sort()];
 }
 export function atomicWrite(file: string, text: string) {
   mkdirSync(resolve(file, '..'), { recursive: true, mode: 0o700 });
@@ -55,6 +67,12 @@ export function loadConfig(dir: string): ProfileConfig {
   return { compactor: value.compactor, subagent: value.subagent };
 }
 export function instructions(dir: string) { return readFileSync(join(dir, 'AGENTS.md'), 'utf8'); }
+/** The team's AGENTS.md, prefixed so it can be appended after the member's own instructions; '' for solo profiles. */
+export function teamInstructions(dir: string): string {
+  const t = teamOf(dir);
+  const file = t && join(t.root, 'AGENTS.md');
+  return file && existsSync(file) ? `\n\n${readFileSync(file, 'utf8')}` : '';
+}
 export function lastProfile() {
   try { const name = readFileSync(join(dataHome(), 'last-profile'), 'utf8').trim(); return listProfiles().includes(name) ? name : undefined; }
   catch { return undefined; }

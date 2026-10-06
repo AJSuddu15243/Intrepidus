@@ -8,7 +8,7 @@ import { parseSkillBlock, type ExtensionAPI, type ExtensionContext, type Extensi
 import { Type } from 'typebox';
 import { Memory } from './memory.ts';
 import { createCompressor } from './compactor.ts';
-import { atomicWrite, createProfile, instructions, lastProfile, listProfiles, loadConfig, lockProfile, profilePath, rememberProfile, saveConfig, teamOf, ProfileBusyError, type ProfileConfig } from './profiles.ts';
+import { atomicWrite, createProfile, instructions, lastProfile, listProfiles, loadConfig, lockProfile, profilePath, rememberProfile, saveConfig, teamInstructions, teamOf, ProfileBusyError, type ProfileConfig } from './profiles.ts';
 import { MASTER, TEAM_DOC, VIEW_DOC } from './prompts.ts';
 import { cachePayload, record } from './cache.ts';
 import { asUser, boundedMessage, buildContext, logMessage, previousExchange, REPORT_TYPE, RUN_BOUNDARY, textContent, typedText } from './transcript.ts';
@@ -18,7 +18,7 @@ import { Team, TEAM_BYTES } from './team.ts';
 import { Children, CWD_DOC, loadedBuiltins } from './agents.ts';
 import { exportBrowser } from './browser.ts';
 import { Inbox } from './inbox.ts';
-import { checkpoint } from './checkpoint.ts';
+import { checkpoint, joinTeam } from './checkpoint.ts';
 import { memoryDirectory, pendingImport, prepareImport, runImport, discardImport } from './import/job.ts';
 import { chooseImport, showProgress } from './import/ui.ts';
 import { IMPORT_GUIDANCE } from './import/guidance.ts';
@@ -56,6 +56,7 @@ export default function optchat(pi: ExtensionAPI) {
   let importTask: Promise<void> | undefined;
   let unmountNavigation: (() => void) | undefined;
   let inspectorController: AbortController | undefined;
+  let offlineNoticed = false;
   const shortcut = inspectorShortcut();
   const title = new TabTitle();
   let working = false;
@@ -66,6 +67,11 @@ export default function optchat(pi: ExtensionAPI) {
   };
   const reportReceipt = (text: string) => 'report:' + createHash('sha256').update(text).digest('hex');
   const errorText = (error: unknown) => error instanceof Error ? error.message : String(error);
+  const offline = (ctx: ExtensionContext) => (reason: string) => {
+    if (offlineNoticed) return;
+    offlineNoticed = true;
+    ctx.ui.notify(`Intrepidus: offline, will sync later (${reason.split('\n')[0].slice(0, 120)})`, 'info');
+  };
   pi.registerFlag('optchat-profile', { description: 'OptChat profile (required for noninteractive sessions without a saved binding)', type: 'string' });
   const required = () => { if (!active) throw new Error('Choose an OptChat profile first: /optchat profile'); return active; };
   const status = (ctx: ExtensionContext) => {
@@ -98,7 +104,7 @@ export default function optchat(pi: ExtensionAPI) {
     reports.push(text); saveReports();
     if (!stopping) sendReport(text);
   };
-  const stop = async () => {
+  const stop = async (ctx?: ExtensionContext) => {
     remote?.close(); remote = undefined;
     inspectorController?.abort(); unmountNavigation?.(); unmountNavigation = undefined;
     stopping = true; importController?.abort(); await importTask?.catch(() => {});
@@ -109,10 +115,11 @@ export default function optchat(pi: ExtensionAPI) {
       await recovery;
       await old.children.close(); flush(); if (!pendingImport(old.dir)) old.inbox.recover(old.memory);
       await old.memory.close(); await checkpoints;
-      await checkpoint(old.dir);
+      await checkpoint(old.dir, ctx ? offline(ctx) : undefined);
     } finally {
       await old.memory.close(); await old.unlock(); active = undefined;
       run = []; previous = []; logged = 0; view = undefined; teamView = ''; runStarted = false; receipts.clear(); prompt = '';
+      offlineNoticed = false;
       untitle?.(); untitle = undefined; title.clear(); working = false;
     }
   };
@@ -125,6 +132,7 @@ export default function optchat(pi: ExtensionAPI) {
     if (selected !== '+ Create profile') return selected;
     const name = (await ctx.ui.input('New profile name', 'work or personal'))?.trim();
     if (!name) return undefined;
+    if (name.includes('/')) throw new Error('Join a team with /optchat team join <url> [handle].');
     createProfile(name); return name;
   };
   const openProfile = async (name: string, ctx: ExtensionContext) => {
@@ -146,11 +154,12 @@ export default function optchat(pi: ExtensionAPI) {
       }), warning => ctx.ui.notify(warning, 'error'));
       openingMemory = memory;
       const t = teamOf(dir);
+      if (t) await checkpoint(dir, offline(ctx)); // pull once at open so Team sees teammates' latest pushes
       const team = t ? new Team(t.root, t.me, TEAM_BYTES, warning => ctx.ui.notify(warning, 'error')) : undefined;
       const inbox = new Inbox(dir);
       const recovered = pendingImport(dir) ? 0 : inbox.recover(memory);
       if (recovered) ctx.ui.notify(`Recovered ${recovered} unanswered inputs into ${name}'s memory. Ask to continue them when ready.`, 'info');
-      const children = new Children(memory, ctx.modelRegistry, () => config.subagent, () => `${instructions(dir)}\n\n${IMPORT_GUIDANCE}`,
+      const children = new Children(memory, ctx.modelRegistry, () => config.subagent, () => `${instructions(dir)}${teamInstructions(dir)}\n\n${IMPORT_GUIDANCE}`,
         deliverReport, text => ctx.ui.notify(text, 'error'), dir, { parentSession: sessionId, usage, builtins: () => loadedBuiltins(pi),
           summarizeHandoff: createHandoffSummarizer(ctx.modelRegistry, () => config.compactor, message => usage.compression(message, 'compactor', sessionId)), team });
       const loggedReports = new Set(memory.root.map(e => e.receipt));
@@ -203,14 +212,14 @@ export default function optchat(pi: ExtensionAPI) {
       }
       if (name !== boundName) pi.appendEntry(binding, { name });
     } catch (error) {
-      if (active) await stop().catch(() => {});
+      if (active) await stop(ctx).catch(() => {});
       fault = errorText(error); ctx.ui.notify(fault, 'error');
     }
     // Pi sets its own title once every session_start handler has finished, so put ours back afterwards.
     for (const ms of [0, 250, 1000]) setTimeout(() => title.reapply(), ms).unref();
   });
   pi.on('session_info_changed', () => title.reapply()); // Pi retitles the tab on session renames, just before this.
-  pi.on('session_shutdown', stop);
+  pi.on('session_shutdown', (_event, ctx) => stop(ctx));
   pi.on('session_before_switch', () => remote || importing || active?.children.active ? { cancel: true } : undefined);
   pi.on('session_before_fork', () => remote || importing || active?.children.active ? { cancel: true } : undefined);
   pi.on('input', async (event, ctx) => {
@@ -244,7 +253,7 @@ export default function optchat(pi: ExtensionAPI) {
     const a = required();
     // Pi's own prompt sections (AGENTS.md files, skills, cwd) stay; the profile's instructions go last.
     event.systemPromptOptions.customPrompt = `${MASTER}\n\n${VIEW_DOC}${a.team ? `\n\n${TEAM_DOC}` : ''}\n\nFor conversational continuity, the memory view may be followed by the immediately preceding completed exchange (its user requests and final answer, in full text), then the new input. Use that exact wording to understand follow-ups; older exchanges and previous tool output remain accessible through memory and zoom.`;
-    event.systemPromptOptions.sections.instructions = `${instructions(a.dir)}\n\n${IMPORT_GUIDANCE}`;
+    event.systemPromptOptions.sections.instructions = `${instructions(a.dir)}${teamInstructions(a.dir)}\n\n${IMPORT_GUIDANCE}`;
     prompt = event.systemPrompt;
   });
   pi.on('message_end', (event, ctx) => {
@@ -311,7 +320,7 @@ export default function optchat(pi: ExtensionAPI) {
     working = false; showTitle(ctx);
     if (active) {
       const dir = active.dir;
-      checkpoints = checkpoints.then(() => checkpoint(dir)).catch(error => ctx.ui.notify(`Local checkpoint failed: ${errorText(error)}`, 'error'));
+      checkpoints = checkpoints.then(() => checkpoint(dir, offline(ctx))).catch(error => ctx.ui.notify(`Local checkpoint failed: ${errorText(error)}`, 'error'));
       await checkpoints;
     }
   });
@@ -370,6 +379,13 @@ export default function optchat(pi: ExtensionAPI) {
       const a = active;
       const info = a ? `${a.name} · ${a.memory.root.length} messages · ${a.memory.pending} pending\nCompactor: ${a.config.compactor.model} (${a.config.compactor.thinking})\nAgents: ${a.config.subagent.model} (${a.config.subagent.thinking})\n${a.memory.lastError ?? ''}` : 'No active profile';
       action = await ctx.ui.select(`OptChat\n${info}`, ['profile', 'model', 'agents', 'usage', 'instructions', 'browse', 'import']) ?? '';
+    }
+    if (action.startsWith('team join')) {
+      const [, , url, handle = (process.env.USER ?? '').toLowerCase()] = action.split(/\s+/);
+      if (!url) throw new Error('Usage: /optchat team join <url> [handle]');
+      const joined = await joinTeam(url, handle, text => ctx.ui.notify(text, 'info'));
+      ctx.ui.notify(`Joined ${joined.name}. Select it with /optchat profile. Install the team's skills with: pi install ${joined.root}`, 'info');
+      return;
     }
     if (action === 'import') {
       const a = required();
@@ -444,7 +460,7 @@ export default function optchat(pi: ExtensionAPI) {
     try { await remote.tell(args); } catch (error) { ctx.ui.notify(errorText(error), 'error'); }
   } });
   pi.registerCommand('optchat', { description: 'OptChat profiles, models, agents, instructions, memory browser, and imports',
-    getArgumentCompletions: prefix => ['profile', 'model', 'agents', 'agents model', 'usage', 'instructions', 'browse', 'import'].filter(s => s.startsWith(prefix)).map(value => ({ value, label: value })),
+    getArgumentCompletions: prefix => ['profile', 'model', 'agents', 'agents model', 'usage', 'instructions', 'browse', 'import', 'team join'].filter(s => s.startsWith(prefix)).map(value => ({ value, label: value })),
     handler: async (args, ctx) => { try { await command(args, ctx); } catch (error) { ctx.ui.notify(errorText(error), 'error'); } },
   });
 }
