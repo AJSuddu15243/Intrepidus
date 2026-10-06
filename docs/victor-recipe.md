@@ -13,8 +13,8 @@ The source remains upstream rather than duplicating the full article here. Its f
 - `src/memory.ts`: append-only log, binary summary tree, compression scheduling, bounded view, zoom/date.
 - `src/compactor.ts`: contextual compression and size retries.
 - `src/cache.ts`: stable Anthropic cache boundaries.
-- `src/transcript.ts`: fresh context per parent run, current-run tool loop retained.
+- `src/transcript.ts`: fresh context per parent run, current-run tool loop retained. The previous completed exchange is also retained in full text, an intentional addition to the summary-only recipe for conversational continuity.
 - `src/agents.ts`: asynchronous Pi SDK children and automatic completion reports.
-- `src/import/`: profile-scoped historical imports, an addition to the recipe.
+- `src/import/`: profile-scoped historical imports retain user messages and final assistant replies, following the lighter history described in recipe section 10. Source adapters, final-reply detection, replay filtering, and ChatGPT branch labels are integration choices. Live-chat tool logging remains unchanged.
 
 Profiles, native Pi UI, conversation import, and local Git checkpoints are integration choices described in the README.

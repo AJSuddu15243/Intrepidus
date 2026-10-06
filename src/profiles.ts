@@ -54,10 +54,17 @@ export function lastProfile() {
 }
 export function rememberProfile(name: string) { atomicWrite(join(dataHome(), 'last-profile'), name); }
 
+export class ProfileBusyError extends Error {
+  constructor(readonly owner: string) { super(`Profile already running: ${owner}`); }
+}
+export function profileSocket(dir: string, purpose: 'lock' | 'windows' = 'lock') {
+  const hash = createHash('sha256').update(dir).digest('hex').slice(0, 24);
+  return join(tmpdir(), `pi-optchat-${process.getuid?.() ?? 'user'}-${hash}${purpose === 'lock' ? '' : '-windows'}.sock`);
+}
+
 /** OS-owned socket lifetime, no timeout-based stealing of a busy profile. */
 export async function lockProfile(dir: string, description: string) {
-  const hash = createHash('sha256').update(dir).digest('hex').slice(0, 24);
-  const socketPath = join(tmpdir(), `pi-optchat-${process.getuid?.() ?? 'user'}-${hash}.sock`);
+  const socketPath = profileSocket(dir);
   const server = createServer(socket => { socket.end(description); });
   const listen = () => new Promise<void>((resolve, reject) => {
     const failed = (error: Error) => { server.off('listening', ready); reject(error); };
@@ -75,7 +82,7 @@ export async function lockProfile(dir: string, description: string) {
       socket.on('end', () => resolve(message || 'another Pi instance'));
       socket.on('error', e => { if ('code' in e && e.code === 'ECONNREFUSED') resolve(undefined); else reject(e); });
     });
-    if (owner !== undefined) throw new Error(`Profile already running: ${owner}`);
+    if (owner !== undefined) throw new ProfileBusyError(owner);
     if (statSync(socketPath).ino !== before.ino) throw new Error('Profile lock changed; try again.');
     unlinkSync(socketPath); await listen();
   }
