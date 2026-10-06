@@ -36,7 +36,7 @@ export function appendJson(file: string, value: unknown) {
     fsyncSync(fd);
   } finally { closeSync(fd); }
 }
-function records(dir: string, warn: (s: string) => void): unknown[] {
+function records(dir: string, warn: (s: string) => void, repair = true): unknown[] {
   if (!existsSync(dir)) return [];
   const result: unknown[] = [];
   for (const name of readdirSync(dir).filter(n => n.endsWith('.jsonl')).sort()) {
@@ -47,7 +47,7 @@ function records(dir: string, warn: (s: string) => void): unknown[] {
       try { result.push(JSON.parse(line)); }
       catch { warn(`Skipped damaged JSON at ${file}:${index + 1}`); }
     }
-    if (text && !text.endsWith('\n')) {
+    if (repair && text && !text.endsWith('\n')) {
       const fd = openSync(file, 'a');
       try { writeSync(fd, '\n'); fsyncSync(fd); } finally { closeSync(fd); }
     }
@@ -88,13 +88,14 @@ export class Memory {
 
   constructor(readonly directory: string, private readonly compress: Compressor,
     private readonly warn: (s: string) => void = console.error,
-    readonly budget = VIEW, private readonly jobs = 8, private readonly retryMs = 10_000) {
-    for (const sub of ['main', 'tree']) mkdirSync(join(directory, sub), { recursive: true, mode: 0o700 });
-    for (const value of records(join(directory, 'main'), warn)) {
+    readonly budget = VIEW, private readonly jobs = 8, private readonly retryMs = 10_000,
+    readonly readOnly = false) {
+    if (!readOnly) for (const sub of ['main', 'tree']) mkdirSync(join(directory, sub), { recursive: true, mode: 0o700 });
+    for (const value of records(join(directory, 'main'), warn, !readOnly)) {
       if (!isEntry(value) || value.i !== this.root.length) throw new Error('Invalid/noncontiguous OptChat log; refusing to change it.');
       this.root.push({ ...value, size: bytes(`${value.kind}: ${value.text}`) });
     }
-    for (const value of records(join(directory, 'tree'), warn)) {
+    for (const value of records(join(directory, 'tree'), warn, !readOnly)) {
       if (!isSummary(value) || value.l < 0 || value.i < 0 || end(value) > this.root.length)
         throw new Error('Invalid OptChat summary record.');
       if (value.l === 0 && !this.tree.has(key(value))) this.leaves++;
@@ -102,9 +103,10 @@ export class Memory {
     }
     // Fold history in order; do not retile the entire log on each turn.
     for (let i = 0; i < this.root.length; i++) { this.push(i); this.fit(i + 1); }
-    this.schedule();
+    if (!readOnly) this.schedule();
   }
   append(kind: Kind, text: string, date = new Date().toISOString(), receipt?: string) {
+    if (this.readOnly) throw new Error('Memory is read-only.');
     if (this.stopped) throw new Error('Memory is closed.');
     const entry: Entry = { i: this.root.length, kind, text, date, size: bytes(`${kind}: ${text}`), ...(receipt ? { receipt } : {}) };
     appendJson(join(this.directory, 'main', `${localDay()}.jsonl`), entry);

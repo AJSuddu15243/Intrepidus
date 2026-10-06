@@ -1,7 +1,7 @@
 import { chmodSync, closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { createConnection, createServer } from 'node:net';
 import { homedir, tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import { createHash } from 'node:crypto';
 import type { ModelChoice } from './compactor.ts';
 import { record } from './cache.ts';
@@ -12,13 +12,20 @@ export const defaults: ProfileConfig = {
   compactor: { provider: 'anthropic', model: 'claude-sonnet-5-5', thinking: 'medium' },
   subagent: { provider: 'anthropic', model: 'claude-opus-5-5', thinking: 'high' },
 };
+const NAME = /^[a-z0-9][a-z0-9_-]{0,63}$/;
 export function profilePath(name: string) {
-  if (!/^[a-z0-9][a-z0-9_-]{0,63}$/.test(name)) throw new Error('Profile names: 1–64 lowercase letters, digits, hyphens, or underscores.');
-  return join(dataHome(), 'profiles', name);
+  const segments = name.split('/');
+  if (segments.length > 2 || segments.some(segment => !NAME.test(segment)))
+    throw new Error('Profile names: 1–64 lowercase letters, digits, hyphens, or underscores; team members are team/handle.');
+  return segments.length === 2 ? join(dataHome(), 'teams', segments[0], segments[1]) : join(dataHome(), 'profiles', name);
+}
+export function teamOf(dir: string): { root: string; me: string } | undefined {
+  const root = dirname(dir);
+  return dirname(root) === join(dataHome(), 'teams') ? { root, me: basename(dir) } : undefined;
 }
 export function listProfiles() {
   const root = join(dataHome(), 'profiles');
-  return existsSync(root) ? readdirSync(root, { withFileTypes: true }).filter(f => f.isDirectory() && /^[a-z0-9][a-z0-9_-]{0,63}$/.test(f.name)).map(f => f.name).sort() : [];
+  return existsSync(root) ? readdirSync(root, { withFileTypes: true }).filter(f => f.isDirectory() && NAME.test(f.name)).map(f => f.name).sort() : [];
 }
 export function atomicWrite(file: string, text: string) {
   mkdirSync(resolve(file, '..'), { recursive: true, mode: 0o700 });

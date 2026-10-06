@@ -8,12 +8,13 @@ import { parseSkillBlock, type ExtensionAPI, type ExtensionContext, type Extensi
 import { Type } from 'typebox';
 import { Memory } from './memory.ts';
 import { createCompressor } from './compactor.ts';
-import { atomicWrite, createProfile, instructions, lastProfile, listProfiles, loadConfig, lockProfile, profilePath, rememberProfile, saveConfig, ProfileBusyError, type ProfileConfig } from './profiles.ts';
-import { MASTER, VIEW_DOC } from './prompts.ts';
+import { atomicWrite, createProfile, instructions, lastProfile, listProfiles, loadConfig, lockProfile, profilePath, rememberProfile, saveConfig, teamOf, ProfileBusyError, type ProfileConfig } from './profiles.ts';
+import { MASTER, TEAM_DOC, VIEW_DOC } from './prompts.ts';
 import { cachePayload, record } from './cache.ts';
 import { asUser, boundedMessage, buildContext, logMessage, previousExchange, REPORT_TYPE, RUN_BOUNDARY, textContent, typedText } from './transcript.ts';
 import { registerReportRenderer } from './report-message.ts';
 import { memoryTools, result } from './tools.ts';
+import { Team, TEAM_BYTES } from './team.ts';
 import { Children, CWD_DOC, loadedBuiltins } from './agents.ts';
 import { exportBrowser } from './browser.ts';
 import { Inbox } from './inbox.ts';
@@ -31,7 +32,7 @@ import { createHandoffSummarizer } from './handoff.ts';
 import { mainTitle, TabTitle } from './title.ts';
 
 const binding = 'optchat.profile';
-interface Active { name: string; dir: string; config: ProfileConfig; memory: Memory; inbox: Inbox; children: Children; usage: UsageLedger; unlock: () => Promise<void> }
+interface Active { name: string; dir: string; config: ProfileConfig; memory: Memory; team?: Team; inbox: Inbox; children: Children; usage: UsageLedger; unlock: () => Promise<void> }
 
 export default function optchat(pi: ExtensionAPI) {
   let active: Active | undefined;
@@ -42,6 +43,7 @@ export default function optchat(pi: ExtensionAPI) {
   let previous: AgentMessage[] = [];
   let logged = 0;
   let view: string | undefined;
+  let teamView = '';
   let prompt = '';
   let runStarted = false;
   let fault: string | undefined;
@@ -110,7 +112,7 @@ export default function optchat(pi: ExtensionAPI) {
       await checkpoint(old.dir);
     } finally {
       await old.memory.close(); await old.unlock(); active = undefined;
-      run = []; previous = []; logged = 0; view = undefined; runStarted = false; receipts.clear(); prompt = '';
+      run = []; previous = []; logged = 0; view = undefined; teamView = ''; runStarted = false; receipts.clear(); prompt = '';
       untitle?.(); untitle = undefined; title.clear(); working = false;
     }
   };
@@ -143,17 +145,19 @@ export default function optchat(pi: ExtensionAPI) {
         status(ctx);
       }), warning => ctx.ui.notify(warning, 'error'));
       openingMemory = memory;
+      const t = teamOf(dir);
+      const team = t ? new Team(t.root, t.me, TEAM_BYTES, warning => ctx.ui.notify(warning, 'error')) : undefined;
       const inbox = new Inbox(dir);
       const recovered = pendingImport(dir) ? 0 : inbox.recover(memory);
       if (recovered) ctx.ui.notify(`Recovered ${recovered} unanswered inputs into ${name}'s memory. Ask to continue them when ready.`, 'info');
       const children = new Children(memory, ctx.modelRegistry, () => config.subagent, () => `${instructions(dir)}\n\n${IMPORT_GUIDANCE}`,
         deliverReport, text => ctx.ui.notify(text, 'error'), dir, { parentSession: sessionId, usage, builtins: () => loadedBuiltins(pi),
-          summarizeHandoff: createHandoffSummarizer(ctx.modelRegistry, () => config.compactor, message => usage.compression(message, 'compactor', sessionId)) });
+          summarizeHandoff: createHandoffSummarizer(ctx.modelRegistry, () => config.compactor, message => usage.compression(message, 'compactor', sessionId)), team });
       const loggedReports = new Set(memory.root.map(e => e.receipt));
       reports = saved.filter((s): s is string => typeof s === 'string' && !loggedReports.has(reportReceipt(s)));
       atomicWrite(pending, JSON.stringify(reports));
       rememberProfile(name);
-      active = { name, dir, config, memory, inbox, children, usage, unlock }; fault = undefined;
+      active = { name, dir, config, memory, team, inbox, children, usage, unlock }; fault = undefined;
       if (ctx.mode === 'tui') unmountNavigation = mountNavigation(ctx, children, shortcut, page => { void inspect(ctx, page); });
       closeWindows = await serveWindows(dir, children, () => !stopping && !importing && !pendingImport(dir), deliverReport);
       untitle = children.subscribe(() => showTitle(ctx)); showTitle(ctx);
@@ -226,7 +230,7 @@ export default function optchat(pi: ExtensionAPI) {
     return { action: 'continue' };
   });
   const startRun = (ctx: ExtensionContext) => {
-    flush(); run = []; logged = 0; view = undefined; runStarted = true;
+    flush(); run = []; logged = 0; view = undefined; teamView = ''; runStarted = true;
     previous = previousExchange(ctx.sessionManager.getBranch());
     pi.appendEntry(RUN_BOUNDARY, { state: 'start' });
   };
@@ -239,7 +243,7 @@ export default function optchat(pi: ExtensionAPI) {
     startRun(ctx);
     const a = required();
     // Pi's own prompt sections (AGENTS.md files, skills, cwd) stay; the profile's instructions go last.
-    event.systemPromptOptions.customPrompt = `${MASTER}\n\n${VIEW_DOC}\n\nFor conversational continuity, the memory view may be followed by the immediately preceding completed exchange (its user requests and final answer, in full text), then the new input. Use that exact wording to understand follow-ups; older exchanges and previous tool output remain accessible through memory and zoom.`;
+    event.systemPromptOptions.customPrompt = `${MASTER}\n\n${VIEW_DOC}${a.team ? `\n\n${TEAM_DOC}` : ''}\n\nFor conversational continuity, the memory view may be followed by the immediately preceding completed exchange (its user requests and final answer, in full text), then the new input. Use that exact wording to understand follow-ups; older exchanges and previous tool output remain accessible through memory and zoom.`;
     event.systemPromptOptions.sections.instructions = `${instructions(a.dir)}\n\n${IMPORT_GUIDANCE}`;
     prompt = event.systemPrompt;
   });
@@ -276,9 +280,10 @@ export default function optchat(pi: ExtensionAPI) {
         ctx.ui.setWorkingMessage('Waiting for OptChat summaries…');
         await a.memory.settle(ctx.signal);
         view = a.memory.render(); // Capture old history before logging the new input.
+        a.team?.reload(); teamView = a.team?.render() ?? '';
         flush(); ctx.ui.setWorkingMessage();
       }
-      return { messages: buildContext(event.messages, run, view, prompt, previous) };
+      return { messages: buildContext(event.messages, run, view, prompt, previous, teamView) };
     } catch (error) {
       // Pi catches extension errors. Explicitly abort so it cannot fall back to old context.
       ctx.abort();
@@ -312,7 +317,7 @@ export default function optchat(pi: ExtensionAPI) {
   });
   registerConnectedRenderer(pi);
   registerReportRenderer(pi);
-  for (const tool of memoryTools(() => required().memory)) pi.registerTool(tool);
+  for (const tool of memoryTools(() => required().memory, () => required().team)) pi.registerTool(tool);
   pi.registerTool({ name: 'spawn', label: 'Spawn background agents',
     description: 'Start background subagents, returning IDs immediately. Use only when the user asks. Give each task the cwd of the project it works on, so the subagent starts there with that project\'s AGENTS.md. Each receives the current memory view and read-only zoom/date. Children may delegate two more levels; the whole profile allows 8 active agents. Completion reports arrive automatically; never poll or sleep waiting for them.',
     parameters: Type.Object({ tasks: Type.Array(Type.Object({ task: Type.String(), cwd: Type.Optional(Type.String({ description: CWD_DOC })) }), { minItems: 1, maxItems: 8 }) }),

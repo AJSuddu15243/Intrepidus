@@ -6,9 +6,10 @@ import { createAgentSession, DefaultResourceLoader, SessionManager, SettingsMana
 import * as sdk from '@earendil-works/pi-coding-agent';
 import type { AgentMessage } from '@earendil-works/pi-agent-core';
 import type { Api, Model } from '@earendil-works/pi-ai';
-import { SUBAGENT, VIEW_DOC } from './prompts.ts';
+import { SUBAGENT, TEAM_DOC, VIEW_DOC } from './prompts.ts';
 import { memoryTools } from './tools.ts';
 import { type Memory } from './memory.ts';
+import type { Team } from './team.ts';
 import type { ModelChoice } from './compactor.ts';
 import { cachePayload } from './cache.ts';
 import { RunHistory, sessionMessages, type RunInfo, type FinishReason } from './runs.ts';
@@ -26,7 +27,8 @@ export interface LiveRun {
 interface Options { parentSession?: string; usage?: UsageLedger; createSession?: typeof createAgentSession;
   /** Names of the built-in extensions the main session loaded (see `loadedBuiltins`). */
   builtins?: () => Iterable<string>;
-  summarizeHandoff?: (run: RunInfo, messages: AgentMessage[], descendants?: HandoffEvidence[]) => Promise<string> }
+  summarizeHandoff?: (run: RunInfo, messages: AgentMessage[], descendants?: HandoffEvidence[]) => Promise<string>;
+  team?: Team }
 
 // Subagents load the user's installed extensions, except any copy of OptChat itself: they get memory tools directly and must not open a profile.
 const packageName = (path: string): string | undefined => {
@@ -129,6 +131,7 @@ export class Children {
     if (this.closing) throw new Error('Profile is closing.');
     if (this.running.size + this.launching + tasks.length > 8) throw new Error('Profile limit: at most 8 active agents, including parents and descendants. Reduce the batch or continue without delegating.');
     const view = this.memory.render();
+    const teamText = this.options.team?.render() ?? '';
     const selected = this.choice();
     const model = this.registry.find(selected.provider, selected.model);
     if (!model) throw new Error(`Subagent model unavailable: ${selected.provider}/${selected.model}`);
@@ -164,7 +167,7 @@ export class Children {
     } finally { this.launching -= reserved; }
     // Each child reports independently. A slow sibling must not hold back a finished result.
     for (const live of launched) {
-      const work = this.execute(live, `${view}\n\nYour task:\n${live.info.task}`).catch(error => this.warn(`Subagent completion failed: ${String(error)}`))
+      const work = this.execute(live, `${view}${teamText ? `\n${teamText}` : ''}\n\nYour task:\n${live.info.task}`).catch(error => this.warn(`Subagent completion failed: ${String(error)}`))
         .finally(() => { this.completions.delete(work); this.changed(); });
       this.completions.add(work);
       live.completion = work;
@@ -189,7 +192,7 @@ export class Children {
         if (provider) pi.registerProvider(o.provider, provider);
         // Same prompt as the main agent (AGENTS.md files, skills, cwd); only the OptChat preamble differs.
         pi.on('before_agent_start', event => {
-          event.systemPromptOptions.customPrompt = `${SUBAGENT}\n\n${VIEW_DOC}`;
+          event.systemPromptOptions.customPrompt = `${SUBAGENT}\n\n${VIEW_DOC}${this.options.team ? `\n\n${TEAM_DOC}` : ''}`;
           event.systemPromptOptions.sections.instructions = instructions;
         });
         pi.on('before_provider_request', (event, ctx) => ctx.model?.api === 'anthropic-messages' ? cachePayload(event.payload) : event.payload);
@@ -198,7 +201,7 @@ export class Children {
     await loader.reload();
     const { session } = await (this.options.createSession ?? createAgentSession)({ cwd: directory, resourceLoader: loader, settingsManager,
       model: o.model, thinkingLevel: o.thinking, sessionManager: o.sessionManager,
-      customTools: [...memoryTools(() => this.memory), ...(depth < 3 ? this.delegationTools(id, directory) : []), this.parentTool(id, parentId, connected)],
+      customTools: [...memoryTools(() => this.memory, () => this.options.team), ...(depth < 3 ? this.delegationTools(id, directory) : []), this.parentTool(id, parentId, connected)],
       excludeTools: depth < 3 ? [] : ['spawn', 'tell'],
     });
     // Callers track the session only after this returns: clean up here if its extensions fail to start.
